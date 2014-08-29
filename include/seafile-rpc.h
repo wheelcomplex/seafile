@@ -251,6 +251,7 @@ seafile_clone (const char *repo_id,
                const char *email,
                const char *random_key,
                int enc_version,
+               const char *server_url,
                GError **error);
 
 char *
@@ -267,6 +268,7 @@ seafile_download (const char *repo_id,
                   const char *email,
                   const char *random_key,
                   int enc_version,
+                  const char *server_url,
                   GError **error);
 
 int
@@ -331,26 +333,6 @@ seafile_gc (GError **error);
 /* seafile_gc_get_progress (GError **error); */
 
 /* -----------------  Task Related --------------  */
-
-/**
- * seafile_get_upload_task_list:
- *
- * List all the upload tasks.
- *
- * Returns: A list of task info.
- */
-GList* seafile_get_upload_task_list (GError **error);
-
-
-/**
- * seafile_get_download_task_list:
- *
- * List all the download tasks.
- *
- * Returns: A list of task info.
- */
-GList* seafile_get_download_task_list (GError **error);
-
 
 /**
  * seafile_find_transfer:
