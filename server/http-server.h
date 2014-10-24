@@ -12,28 +12,23 @@
 
 struct _SeafileSession;
 
-typedef struct TokenInfo {
-    char *repo_id;
-    char *email;
-    long expire_time;
-} TokenInfo;
-
 typedef struct HttpServer {
     char *bind_addr;
     int bind_port;
     evbase_t *evbase;
     evhtp_t *evhtp;
     pthread_t thread_id;
+
     GHashTable *token_cache;
-    pthread_mutex_t token_cache_lock;
-    event_t *token_timer;
+    pthread_mutex_t token_cache_lock; /* token -> username */
+
+    GHashTable *perm_cache;
+    pthread_mutex_t perm_cache_lock; /* repo_id:username -> permission */
+
+    event_t *reap_timer;
+
     struct _SeafileSession *seaf_session;
 } HttpServer;
-
-typedef enum CheckExistType {
-    CHECK_FS_EXIST,
-    CHECK_BLOCK_EXIST
-} CheckExistType;
 
 HttpServer *
 seaf_http_server_new (struct _SeafileSession *session);
@@ -42,12 +37,5 @@ void seaf_http_server_release (HttpServer *htp_server);
 
 int
 seaf_http_server_start (HttpServer *htp_server);
-
-int
-seaf_http_server_join (HttpServer *htp_server);
-
-int
-seaf_http_server_detach (HttpServer *htp_server);
-
 
 #endif

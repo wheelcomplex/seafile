@@ -28,13 +28,7 @@
 #include "seafile-session.h"
 #include "fileserver.h"
 #include "upload-file.h"
-
-
-#define SEAF_HTTP_RES_BADFILENAME 440
-#define SEAF_HTTP_RES_EXISTS 441
-#define SEAF_HTTP_RES_NOT_EXISTS 441
-#define SEAF_HTTP_RES_TOOLARGE 442
-#define SEAF_HTTP_RES_NOQUOTA 443
+#include "http-status-codes.h"
 
 enum RecvState {
     RECV_INIT,
