@@ -438,13 +438,38 @@ add_empty_dir_to_index (struct index_state *istate,
                         const char *path,
                         SeafStat *st);
 
+typedef void (*CECallback) (struct cache_entry *ce, void *user_data);
+
 int
-remove_from_index_with_prefix (struct index_state *istate, const char *path_prefix);
+remove_from_index_with_prefix (struct index_state *istate, const char *path_prefix,
+                               gboolean *not_found);
 
 int
 rename_index_entries (struct index_state *istate,
                       const char *src_path,
-                      const char *dst_path);
+                      const char *dst_path,
+                      gboolean *not_found,
+                      CECallback cb_after_rename,
+                      void *cb_data);
+
+int
+add_empty_dir_to_index_with_check (struct index_state *istate,
+                                   const char *path, SeafStat *st);
+
+void remove_empty_parent_dir_entry (struct index_state *istate, const char *path);
+
+struct _IndexDirent {
+    char *dname;
+    gboolean is_dir;
+    struct cache_entry *ce;
+};
+typedef struct _IndexDirent IndexDirent;
+
+void
+index_dirent_free (IndexDirent *dent);
+
+GList *
+list_dirents_from_index (struct index_state *istate, const char *dir);
 
 extern int add_file_to_index(struct index_state *, const char *path, int flags);
 extern struct cache_entry *make_cache_entry(unsigned int mode, const unsigned char *sha1, const char *path, const char *full_path, int stage, int refresh);

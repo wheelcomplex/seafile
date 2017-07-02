@@ -1,5 +1,7 @@
 #include "common.h"
 
+#include "log.h"
+
 #ifndef SEAFILE_SERVER
 #include "db.h"
 #else
@@ -261,7 +263,7 @@ seaf_branch_manager_del_branch (SeafBranchManager *mgr,
     sql = sqlite3_mprintf ("DELETE FROM Branch WHERE name = %Q AND "
                            "repo_id = '%s'", name, repo_id);
     if (sqlite_query_exec (mgr->priv->db, sql) < 0)
-        g_warning ("Delete branch %s failed\n", name);
+        seaf_warning ("Delete branch %s failed\n", name);
     sqlite3_free (sql);
 
     pthread_mutex_unlock (&mgr->priv->db_lock);
@@ -348,6 +350,9 @@ publish_repo_update_event (CEvent *event, void *data)
 static void
 on_branch_updated (SeafBranchManager *mgr, SeafBranch *branch)
 {
+    if (seaf_repo_manager_is_virtual_repo (seaf->repo_mgr, branch->repo_id))
+        return;
+
     RepoUpdateEventData *rdata = g_new0 (RepoUpdateEventData, 1);
 
     rdata->repo_id = g_strdup (branch->repo_id);
@@ -391,8 +396,6 @@ seaf_branch_manager_test_and_update_branch (SeafBranchManager *mgr,
         return -1;
     }
     if (strcmp (old_commit_id, commit_id) != 0) {
-        g_message ("[branch mgr] Branch update conflict for repo %s, rollback.\n",
-                   branch->repo_id);
         seaf_db_rollback (trans);
         seaf_db_trans_close (trans);
         return -1;
@@ -442,7 +445,7 @@ real_get_branch (SeafBranchManager *mgr,
                            "WHERE name = %Q and repo_id='%s'",
                            name, repo_id);
     if (!(stmt = sqlite_query_prepare (db, sql))) {
-        g_warning ("[Branch mgr] Couldn't prepare query %s\n", sql);
+        seaf_warning ("[Branch mgr] Couldn't prepare query %s\n", sql);
         sqlite3_free (sql);
         pthread_mutex_unlock (&mgr->priv->db_lock);
         return NULL;
@@ -459,7 +462,7 @@ real_get_branch (SeafBranchManager *mgr,
         return branch;
     } else if (result == SQLITE_ERROR) {
         const char *str = sqlite3_errmsg (db);
-        g_warning ("Couldn't prepare query, error: %d->'%s'\n",
+        seaf_warning ("Couldn't prepare query, error: %d->'%s'\n",
                    result, str ? str : "no error given");
     }
 
@@ -514,7 +517,7 @@ real_get_branch (SeafBranchManager *mgr,
     if (seaf_db_statement_foreach_row (mgr->seaf->db, sql, 
                                        get_branch, commit_id,
                                        2, "string", name, "string", repo_id) < 0) {
-        g_warning ("[branch mgr] DB error when get branch %s.\n", name);
+        seaf_warning ("[branch mgr] DB error when get branch %s.\n", name);
         return NULL;
     }
 
@@ -607,7 +610,7 @@ seaf_branch_manager_get_branch_list (SeafBranchManager *mgr,
             break;
         if (result == SQLITE_ERROR) {
             const gchar *str = sqlite3_errmsg (db);
-            g_warning ("Couldn't prepare query, error: %d->'%s'\n", 
+            seaf_warning ("Couldn't prepare query, error: %d->'%s'\n", 
                        result, str ? str : "no error given");
             sqlite3_finalize (stmt);
             seaf_branch_list_free (ret);
@@ -651,7 +654,7 @@ seaf_branch_manager_get_branch_list (SeafBranchManager *mgr,
     if (seaf_db_statement_foreach_row (mgr->seaf->db, sql, 
                                        get_branches, &ret,
                                        1, "string", repo_id) < 0) {
-        g_warning ("[branch mgr] DB error when get branch list.\n");
+        seaf_warning ("[branch mgr] DB error when get branch list.\n");
         return NULL;
     }
 

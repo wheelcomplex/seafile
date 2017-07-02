@@ -16,6 +16,7 @@
 #include "merge.h"
 #include "vc-utils.h"
 #include "vc-common.h"
+#include "index/index.h"
 
 static gint
 compare_dirents (gconstpointer a, gconstpointer b)
@@ -145,52 +146,140 @@ update_index (struct index_state *istate, const char *index_path)
     int ret = 0;
 
     snprintf (index_shadow, SEAF_PATH_MAX, "%s.shadow", index_path);
-    index_fd = g_open (index_shadow, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0666);
+    index_fd = seaf_util_create (index_shadow, O_RDWR | O_CREAT | O_TRUNC | O_BINARY,
+                                 0666);
     if (index_fd < 0) {
-        g_warning ("Failed to open shadow index: %s.\n", strerror(errno));
+        seaf_warning ("Failed to open shadow index: %s.\n", strerror(errno));
         return -1;
     }
 
     if (write_index (istate, index_fd) < 0) {
-        g_warning ("Failed to write shadow index: %s.\n", strerror(errno));
+        seaf_warning ("Failed to write shadow index: %s.\n", strerror(errno));
         close (index_fd);
         return -1;
     }
     close (index_fd);
 
-    ret = ccnet_rename (index_shadow, index_path);
+    ret = seaf_util_rename (index_shadow, index_path);
     if (ret < 0) {
-        g_warning ("Failed to update index errno=%d %s\n", errno, strerror(errno));
+        seaf_warning ("Failed to update index errno=%d %s\n", errno, strerror(errno));
         return -1;
     }
     return 0;
 }
 
+#ifndef WIN32
+
 int
 seaf_remove_empty_dir (const char *path)
 {
     SeafStat st;
-    char *ds_store, *thumbs_db;
+    GDir *dir;
+    const char *dname;
+    char *full_path;
+    GError *error = NULL;
 
     if (seaf_stat (path, &st) < 0 || !S_ISDIR(st.st_mode))
         return 0;
 
-    if (g_rmdir (path) < 0) {
-        ds_store = g_build_filename (path, ".DS_Store", NULL);
-        g_unlink (ds_store);
-        g_free (ds_store);
+    if (seaf_util_rmdir (path) < 0) {
+        dir = g_dir_open (path, 0, &error);
+        if (!dir) {
+            seaf_warning ("Failed to open dir %s: %s.\n", path, error->message);
+            return -1;
+        }
 
-        thumbs_db = g_build_filename (path, "Thumbs.db", NULL);
-        g_unlink (thumbs_db);
-        g_free (thumbs_db);
+        /* Remove all ignored hidden files. */
+        while ((dname = g_dir_read_name (dir)) != NULL) {
+            if (seaf_repo_manager_is_ignored_hidden_file(dname)) {
+                full_path = g_build_path ("/", path, dname, NULL);
+                if (seaf_util_unlink (full_path) < 0)
+                    seaf_warning ("Failed to remove file %s: %s.\n",
+                                  full_path, strerror(errno));
+                g_free (full_path);
+            }
+        }
 
-        if (g_rmdir (path) < 0) {
+        g_dir_close (dir);
+
+        if (seaf_util_rmdir (path) < 0) {
+            seaf_warning ("Failed to remove dir %s: %s.\n", path, strerror(errno));
             return -1;
         }
     }
 
     return 0;
 }
+
+#else
+
+static int
+remove_hidden_file (wchar_t *parent, WIN32_FIND_DATAW *fdata,
+                    void *user_data, gboolean *stop)
+{
+    char *dname = NULL;
+    wchar_t *subpath_w = NULL;
+    char *subpath = NULL;
+
+    dname = g_utf16_to_utf8 (fdata->cFileName, -1, NULL, NULL, NULL);
+
+    if (!(fdata->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        seaf_repo_manager_is_ignored_hidden_file(dname)) {
+        subpath_w = g_new0 (wchar_t, wcslen(parent) + wcslen(fdata->cFileName) + 2);
+        wcscpy (subpath_w, parent);
+        wcscat (subpath_w, L"\\");
+        wcscat (subpath_w, fdata->cFileName);
+
+        if (!DeleteFileW (subpath_w)) {
+            subpath = g_utf16_to_utf8 (subpath_w, -1, NULL, NULL, NULL);
+            seaf_warning ("Failed to remove file %s: %lu.\n", subpath, GetLastError());
+            g_free (subpath);
+        }
+
+        g_free (subpath_w);
+    }
+
+    g_free (dname);
+    return 0;
+}
+
+int
+seaf_remove_empty_dir (const char *path)
+{
+    wchar_t *path_w = NULL;
+    WIN32_FILE_ATTRIBUTE_DATA attrs;
+    int ret = 0;
+
+    path_w = win32_long_path (path);
+
+    if (!GetFileAttributesExW (path_w, GetFileExInfoStandard, &attrs)) {
+        goto out;
+    }
+
+    if (!(attrs.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        goto out;
+    }
+
+    if (RemoveDirectoryW (path_w))
+        goto out;
+
+    if (GetLastError() == ERROR_DIR_NOT_EMPTY) {
+        traverse_directory_win32 (path_w, remove_hidden_file, NULL);
+        if (!RemoveDirectoryW (path_w)) {
+            seaf_warning ("Failed to remove dir %s: %lu.\n", path, GetLastError());
+            ret = -1;
+        }
+    } else {
+        seaf_warning ("Failed to remove dir %s: %lu.\n", path, GetLastError());
+        ret = -1;
+    }
+
+out:
+    g_free (path_w);
+    return ret;
+}
+
+#endif  /* WIN32 */
 
 static int
 unlink_entry (struct cache_entry *ce, struct unpack_trees_options *o)
@@ -202,7 +291,7 @@ unlink_entry (struct cache_entry *ce, struct unpack_trees_options *o)
     int offset;
 
     if (!len) {
-        g_warning ("entry name should not be empty.\n");
+        seaf_warning ("entry name should not be empty.\n");
         return -1;
     }
 
@@ -217,18 +306,18 @@ unlink_entry (struct cache_entry *ce, struct unpack_trees_options *o)
         /* file has been changed. */
         if (!o->reset &&
             (ce->current_mtime != st.st_mtime)) {
-            g_warning ("File %s is changed. Skip removing the file.\n", path);
+            seaf_warning ("File %s is changed. Skip removing the file.\n", path);
             return -1;
         }
 
         /* first unlink the file. */
-        if (g_unlink (path) < 0) {
-            g_warning ("Failed to remove %s: %s.\n", path, strerror(errno));
+        if (seaf_util_unlink (path) < 0) {
+            seaf_warning ("Failed to remove %s: %s.\n", path, strerror(errno));
             return -1;
         }
     } else {
         if (seaf_remove_empty_dir (path) < 0) {
-            g_warning ("Failed to remove dir %s: %s.\n", path, strerror(errno));
+            seaf_warning ("Failed to remove dir %s: %s.\n", path, strerror(errno));
             return -1;
         }
     }
@@ -248,43 +337,66 @@ unlink_entry (struct cache_entry *ce, struct unpack_trees_options *o)
     return 0;
 }
 
+static int
+compute_file_id_with_cdc (const char *path, SeafStat *st,
+                          SeafileCrypt *crypt, int repo_version,
+                          uint32_t blk_avg_size, uint32_t blk_min_size, uint32_t blk_max_size,
+                          unsigned char sha1[])
+{
+    CDCFileDescriptor cdc;
+
+    memset (&cdc, 0, sizeof(cdc));
+    cdc.block_sz = blk_avg_size;
+    cdc.block_min_sz = blk_min_size;
+    cdc.block_max_sz = blk_max_size;
+    cdc.write_block = seafile_write_chunk;
+    if (filename_chunk_cdc (path, &cdc, crypt, FALSE) < 0) {
+        seaf_warning ("Failed to chunk file.\n");
+        return -1;
+    }
+
+    if (repo_version > 0)
+        seaf_fs_manager_calculate_seafile_id_json (repo_version, &cdc, sha1);
+    else
+        memcpy (sha1, cdc.file_sum, 20);
+
+    if (cdc.blk_sha1s)
+        free (cdc.blk_sha1s);
+
+    return 0;
+}
+
 int
 compare_file_content (const char *path, SeafStat *st, const unsigned char *ce_sha1,
                       SeafileCrypt *crypt, int repo_version)
 {
-    CDCFileDescriptor cdc;
     unsigned char sha1[20];
 
     if (st->st_size == 0) {
         memset (sha1, 0, 20);
+        return hashcmp (sha1, ce_sha1);
     } else {
-        memset (&cdc, 0, sizeof(cdc));
-        cdc.block_sz = calculate_chunk_size (st->st_size);
-        cdc.block_min_sz = cdc.block_sz >> 2;
-        cdc.block_max_sz = cdc.block_sz << 2;
-        cdc.write_block = seafile_write_chunk;
-        if (filename_chunk_cdc (path, &cdc, crypt, FALSE) < 0) {
-            g_warning ("Failed to chunk file.\n");
+        if (compute_file_id_with_cdc (path, st, crypt, repo_version,
+                                      CDC_AVERAGE_BLOCK_SIZE,
+                                      CDC_MIN_BLOCK_SIZE,
+                                      CDC_MAX_BLOCK_SIZE,
+                                      sha1) < 0) {
             return -1;
         }
+        if (hashcmp (sha1, ce_sha1) == 0)
+            return 0;
 
-        if (repo_version > 0)
-            seaf_fs_manager_calculate_seafile_id_json (repo_version, &cdc, sha1);
-        else
-            memcpy (sha1, cdc.file_sum, 20);
-
-        if (cdc.blk_sha1s)
-            free (cdc.blk_sha1s);
+        /* Compare with old cdc block size. */
+        uint32_t block_size = calculate_chunk_size (st->st_size);
+        if (compute_file_id_with_cdc (path, st, crypt, repo_version,
+                                      block_size,
+                                      block_size >> 2,
+                                      block_size << 2,
+                                      sha1) < 0) {
+            return -1;
+        }
+        return hashcmp (sha1, ce_sha1);
     }
-
-#if 0
-    char id1[41], id2[41];
-    rawdata_to_hex (sha1, id1, 20);
-    rawdata_to_hex (ce_sha1, id2, 20);
-    seaf_debug ("id1: %s, id2: %s.\n", id1, id2);
-#endif
-
-    return hashcmp (sha1, ce_sha1);
 }
 
 #if defined WIN32 || defined __APPLE__
@@ -313,13 +425,21 @@ case_conflict_utf8 (const char *name1, const char *name2)
     return ret;
 }
 
+#ifndef WIN32
+
 static gboolean
-case_conflict_exists (const char *dir_path, const char *new_dname)
+case_conflict_exists (const char *dir_path, const char *new_dname,
+                      char **conflict_dname)
 {
     GDir *dir;
     const char *dname;
     gboolean is_case_conflict = FALSE;
     GError *error = NULL;
+
+    /* Don't generate "case conflict" files for a case-conflicted file. */
+    if (strstr (new_dname, "case conflict") != NULL) {
+        return is_case_conflict;
+    }
 
     dir = g_dir_open (dir_path, 0, &error);
     if (!dir && error) {
@@ -333,30 +453,85 @@ case_conflict_exists (const char *dir_path, const char *new_dname)
         if (!dname)
             break;
 
-#ifdef __APPLE__
         char *norm_dname = g_utf8_normalize (dname, -1, G_NORMALIZE_NFC);
         if (case_conflict_utf8 (norm_dname, new_dname)) {
             is_case_conflict = TRUE;
-            g_free (norm_dname);
+            *conflict_dname = norm_dname;
             break;
         }
         g_free (norm_dname);
-#else
-        if (case_conflict_utf8 (dname, new_dname)) {
-            is_case_conflict = TRUE;
-            break;
-        }
-#endif
     }
     g_dir_close (dir);
 
     return is_case_conflict;
 }
 
+#else
+
+typedef struct CaseConflictData {
+    const char *new_dname;
+    gboolean is_case_conflict;
+    char *conflict_dname;
+} CaseConflictData;
+
+static int
+check_case_conflict_cb (wchar_t *parent, WIN32_FIND_DATAW *fdata,
+                        void *user_data, gboolean *stop)
+{
+    CaseConflictData *data = user_data;
+    char *dname = NULL;
+
+    dname = g_utf16_to_utf8 (fdata->cFileName, -1, NULL, NULL, NULL);
+
+    if (case_conflict_utf8 (dname, data->new_dname)) {
+        data->is_case_conflict = TRUE;
+        data->conflict_dname = g_strdup(dname);
+        *stop = TRUE;
+    }
+
+    g_free (dname);
+    return 0;
+}
+
+static gboolean
+case_conflict_exists (const char *dir_path, const char *new_dname,
+                      char **conflict_dname)
+{
+    wchar_t *dir_path_w;
+    gboolean is_case_conflict = FALSE;
+    CaseConflictData data;
+
+    /* Don't generate "case conflict" files for a case-conflicted file. */
+    if (strstr (new_dname, "case conflict") != NULL) {
+        return is_case_conflict;
+    }
+
+    dir_path_w = win32_long_path (dir_path);
+
+    memset (&data, 0, sizeof(data));
+    data.new_dname = new_dname;
+
+    if (traverse_directory_win32 (dir_path_w, check_case_conflict_cb, &data) < 0)
+        goto out;
+
+    is_case_conflict = data.is_case_conflict;
+    *conflict_dname = data.conflict_dname;
+
+out:
+    g_free (dir_path_w);
+    return is_case_conflict;
+}
+
+#endif  /* WIN32 */
+
 /*
  * If files "test (case conflict 1).txt" and "Test (case conflict 2).txt" exist,
  * and we have to checkout "TEST.txt", it will be checked out to "TEST
  * (case conflict 3).txt".
+ * To prevent generating too many case conflict files (in case of bug or other
+ * reasons), no more than 10 case conflict files will be generated for the same
+ * filename. After that, all later confilcted files will use the last conflict
+ * file name.
  */
 static char *
 gen_case_conflict_free_dname (const char *dir_path, const char *dname)
@@ -369,7 +544,7 @@ gen_case_conflict_free_dname (const char *dir_path, const char *dname)
 
     dot = strrchr (copy, '.');
 
-    while (cnt < 255) {
+    while (cnt < 11) {
         if (dot != NULL) {
             *dot = '\0';
             ext = dot + 1;
@@ -384,7 +559,7 @@ gen_case_conflict_free_dname (const char *dir_path, const char *dname)
                              dir_path, copy, cnt);
         }
 
-        if (g_access (buf->str, F_OK) != 0)
+        if (!seaf_util_exists (buf->str))
             break;
 
         g_string_truncate (buf, 0);
@@ -406,17 +581,19 @@ build_case_conflict_free_path (const char *worktree,
                                const char *ce_name,
                                GHashTable *conflict_hash,
                                GHashTable *no_conflict_hash,
-                               gboolean *is_case_conflict)
+                               gboolean *is_case_conflict,
+                               gboolean is_rename)
 {
     GString *buf = g_string_new (worktree);
     char **components, *ptr;
     guint i, n_comps;
     static int dummy;
+    char *conflict_dname = NULL;
 
     components = g_strsplit (ce_name, "/", -1);
     n_comps = g_strv_length (components);
     for (i = 0; i < n_comps; ++i) {
-        char *path = NULL, *dname = NULL, *case_conflict_free_path = NULL;
+        char *path = NULL, *dname = NULL;
         SeafStat st;
 
         ptr = components[i];
@@ -425,7 +602,7 @@ build_case_conflict_free_path (const char *worktree,
         /* If path doesn't exist, case conflict is not possible. */
         if (seaf_stat (path, &st) < 0) {
             if (i != n_comps - 1) {
-                if (g_mkdir (path, 0777) < 0) {
+                if (seaf_util_mkdir (path, 0777) < 0) {
                     seaf_warning ("Failed to create dir %s.\n", path);
                     g_free (path);
                     goto error;
@@ -453,7 +630,7 @@ build_case_conflict_free_path (const char *worktree,
         }
 
         /* No luck in the hash tables, we have to run case conflict detection. */
-        if (!case_conflict_exists (buf->str, ptr)) {
+        if (!case_conflict_exists (buf->str, ptr, &conflict_dname)) {
             /* No case conflict. */
             if (i != n_comps - 1)
                 g_hash_table_insert (no_conflict_hash,
@@ -470,26 +647,50 @@ build_case_conflict_free_path (const char *worktree,
          * remember it in the hash table.
          */
 
-        dname = gen_case_conflict_free_dname (buf->str, ptr);
+        if (!is_rename) {
+            dname = gen_case_conflict_free_dname (buf->str, ptr);
 
-        case_conflict_free_path = g_build_path ("/", buf->str, dname, NULL);
-        if (i != n_comps - 1) {
-            if (g_mkdir (case_conflict_free_path, 0777) < 0) {
-                seaf_warning ("Failed to create dir %s.\n", case_conflict_free_path);
+            char *case_conflict_free_path = g_build_path ("/", buf->str, dname, NULL);
+            if (i != n_comps - 1) {
+                if (seaf_util_mkdir (case_conflict_free_path, 0777) < 0) {
+                    seaf_warning ("Failed to create dir %s.\n",
+                                  case_conflict_free_path);
+                    g_free (path);
+                    g_free (dname);
+                    g_free (case_conflict_free_path);
+                    goto error;
+                }
+
+                g_hash_table_insert (conflict_hash, g_strdup(path), g_strdup(dname));
+            }
+
+            g_string_append_printf (buf, "/%s", dname);
+
+            g_free (dname);
+            g_free (case_conflict_free_path);
+        } else {
+            char *src_path = g_build_path ("/", buf->str, conflict_dname, NULL);
+
+            if (i != (n_comps - 1) && seaf_util_rename (src_path, path) < 0) {
+                seaf_warning ("Failed to rename %s to %s: %s.\n",
+                              src_path, path, strerror(errno));
                 g_free (path);
-                g_free (dname);
-                g_free (case_conflict_free_path);
+                g_free (src_path);
                 goto error;
             }
 
-            g_hash_table_insert (conflict_hash, g_strdup(path), g_strdup(dname));
+            /* Since the exsiting dir in the worktree has been renamed,
+             * there is no more case conflict.
+             */
+            g_hash_table_insert (no_conflict_hash, g_strdup(path), &dummy);
+
+            g_string_append_printf (buf, "/%s", ptr);
+
+            g_free (src_path);
         }
 
-        g_string_append_printf (buf, "/%s", dname);
-
+        g_free (conflict_dname);
         g_free (path);
-        g_free (dname);
-        g_free (case_conflict_free_path);
     }
 
     g_strfreev (components);
@@ -502,8 +703,6 @@ error:
 
 #endif  /* defined WIN32 || defined __APPLE__ */
 
-#ifdef __linux__
-
 char *
 build_checkout_path (const char *worktree, const char *ce_name, int len)
 {
@@ -514,7 +713,7 @@ build_checkout_path (const char *worktree, const char *ce_name, int len)
     SeafStat st;
 
     if (!len) {
-        g_warning ("entry name should not be empty.\n");
+        seaf_warning ("entry name should not be empty.\n");
         return NULL;
     }
 
@@ -535,8 +734,8 @@ build_checkout_path (const char *worktree, const char *ce_name, int len)
         if (seaf_stat (path, &st) == 0 && S_ISDIR(st.st_mode))
             continue;
         
-        if (ccnet_mkdir (path, 0777) < 0) {
-            g_warning ("Failed to create directory %s.\n", path);
+        if (seaf_util_mkdir (path, 0777) < 0) {
+            seaf_warning ("Failed to create directory %s.\n", path);
             return NULL;
         }
     }
@@ -544,8 +743,6 @@ build_checkout_path (const char *worktree, const char *ce_name, int len)
 
     return g_strdup(path);
 }
-
-#endif  /* __linux__ */
 
 static int
 checkout_entry (struct cache_entry *ce,
@@ -562,10 +759,11 @@ checkout_entry (struct cache_entry *ce,
     gboolean force_conflict = FALSE;
 
     path_in = g_build_path ("/", o->base, ce->name, NULL);
-#ifndef __linux__
+#if defined WIN32 || defined __APPLE__
     path = build_case_conflict_free_path (o->base, ce->name,
                                           conflict_hash, no_conflict_hash,
-                                          &case_conflict);
+                                          &case_conflict,
+                                          FALSE);
 #else
     path = build_checkout_path (o->base, ce->name, ce_namelen(ce));
 #endif
@@ -579,20 +777,20 @@ checkout_entry (struct cache_entry *ce,
          * we need first to remove the empty dir.
          */
         if (seaf_stat (path, &st) == 0 && S_ISDIR(st.st_mode)) {
-            if (g_rmdir (path) < 0) {
-                g_warning ("Failed to remove dir %s: %s\n", path, strerror(errno));
+            if (seaf_util_rmdir (path) < 0) {
+                seaf_warning ("Failed to remove dir %s: %s\n", path, strerror(errno));
                 /* Don't quit since we can handle conflict later. */
             }
         }
     } else {
-        if (g_mkdir (path, 0777) < 0) {
-            g_warning ("Failed to create empty dir %s in checkout.\n", path);
+        if (seaf_util_mkdir (path, 0777) < 0) {
+            seaf_warning ("Failed to create empty dir %s in checkout.\n", path);
             g_free (path);
             return -1;
         }
         if (ce->ce_mtime.sec != 0 &&
             seaf_set_file_time (path, ce->ce_mtime.sec) < 0) {
-            g_warning ("Failed to set mtime for %s.\n", path);
+            seaf_warning ("Failed to set mtime for %s.\n", path);
         }
         goto update_cache;
     }
@@ -607,7 +805,7 @@ checkout_entry (struct cache_entry *ce,
          */
         if (!recover_merge || 
             compare_file_content (path, &st, ce->sha1, o->crypt, o->version) != 0) {
-            g_warning ("File %s is changed. Checkout to conflict file.\n", path);
+            seaf_warning ("File %s is changed. Checkout to conflict file.\n", path);
             force_conflict = TRUE;
         } else {
             /* Recover merge and file content matches index entry.
@@ -632,8 +830,9 @@ checkout_entry (struct cache_entry *ce,
                                        ce->name,
                                        conflict_head_id,
                                        force_conflict,
-                                       &conflicted) < 0) {
-        g_warning ("Failed to checkout file %s.\n", path);
+                                       &conflicted,
+                                       NULL) < 0) {
+        seaf_warning ("Failed to checkout file %s.\n", path);
         g_free (path);
         return -1;
     }
@@ -718,7 +917,7 @@ delete_path (const char *worktree, const char *name,
     int len = strlen(name);
 
     if (!len) {
-        g_warning ("entry name should not be empty.\n");
+        seaf_warning ("entry name should not be empty.\n");
         return -1;
     }
 
@@ -732,18 +931,18 @@ delete_path (const char *worktree, const char *name,
 
         /* file has been changed. */
         if (old_mtime != st.st_mtime) {
-            g_warning ("File %s is changed. Skip removing the file.\n", path);
+            seaf_warning ("File %s is changed. Skip removing the file.\n", path);
             return -1;
         }
 
         /* first unlink the file. */
-        if (g_unlink (path) < 0) {
-            g_warning ("Failed to remove %s: %s.\n", path, strerror(errno));
+        if (seaf_util_unlink (path) < 0) {
+            seaf_warning ("Failed to remove %s: %s.\n", path, strerror(errno));
             return -1;
         }
     } else {
         if (seaf_remove_empty_dir (path) < 0) {
-            g_warning ("Failed to remove dir %s: %s.\n", path, strerror(errno));
+            seaf_warning ("Failed to remove dir %s: %s.\n", path, strerror(errno));
             return -1;
         }
     }
@@ -765,25 +964,25 @@ delete_path (const char *worktree, const char *name,
 
 #ifdef WIN32
 
-gboolean
-do_check_file_locked (const char *path, const char *worktree)
+static gboolean
+check_file_locked (const wchar_t *path_w, gboolean locked_on_server)
 {
-    char *real_path;
     HANDLE handle;
-    wchar_t *path_w;
-
-    real_path = g_build_path(PATH_SEPERATOR, worktree, path, NULL);
-    path_w = wchar_from_utf8 (real_path);
-    g_free (real_path);
+    /* If the file is locked on server, its local access right has been set to
+     * read-only. So trying to test GENERIC_WRITE access will certainly return
+     * ACCESS_DENIED. In this case, we can only test for GENERIC_READ.
+     * MS Office seems to gain exclusive read/write access to the file. So even
+     * trying read access can return a SHARING_VIOLATION error.
+     */
+    DWORD access_mode = locked_on_server ? GENERIC_READ : GENERIC_WRITE;
 
     handle = CreateFileW (path_w,
-                          GENERIC_WRITE,
+                          access_mode,
                           0,
                           NULL,
                           OPEN_EXISTING,
                           0,
                           NULL);
-    g_free (path_w);
     if (handle != INVALID_HANDLE_VALUE) {
         CloseHandle (handle);
     } else if (GetLastError() == ERROR_SHARING_VIOLATION) {
@@ -791,6 +990,122 @@ do_check_file_locked (const char *path, const char *worktree)
     }
 
     return FALSE;
+}
+
+gboolean
+do_check_file_locked (const char *path, const char *worktree, gboolean locked_on_server)
+{
+    char *real_path;
+    wchar_t *real_path_w;
+    gboolean ret;
+    real_path = g_build_path(PATH_SEPERATOR, worktree, path, NULL);
+    real_path_w = win32_long_path (real_path);
+    ret = check_file_locked (real_path_w, locked_on_server);
+    g_free (real_path);
+    g_free (real_path_w);
+    return ret;
+}
+
+static gboolean
+check_dir_locked (const wchar_t *path_w)
+{
+    HANDLE handle;
+
+    handle = CreateFileW (path_w,
+                          GENERIC_WRITE,
+                          0,
+                          NULL,
+                          OPEN_EXISTING,
+                          FILE_FLAG_BACKUP_SEMANTICS,
+                          NULL);
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle (handle);
+    } else if (GetLastError() == ERROR_SHARING_VIOLATION) {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static gboolean
+check_dir_locked_recursive (const wchar_t *path_w)
+{
+    WIN32_FIND_DATAW fdata;
+    HANDLE handle;
+    wchar_t *pattern;
+    wchar_t *sub_path_w;
+    char *path;
+    int path_len_w;
+    DWORD error;
+    gboolean ret = FALSE;
+
+    if (check_dir_locked (path_w))
+        return TRUE;
+
+    path = g_utf16_to_utf8 (path_w, -1, NULL, NULL, NULL);
+
+    path_len_w = wcslen(path_w);
+
+    pattern = g_new0 (wchar_t, (path_len_w + 3));
+    wcscpy (pattern, path_w);
+    wcscat (pattern, L"\\*");
+
+    handle = FindFirstFileW (pattern, &fdata);
+    if (handle == INVALID_HANDLE_VALUE) {
+        seaf_warning ("FindFirstFile failed %s: %lu.\n",
+                      path, GetLastError());
+        goto out;
+    }
+
+    do {
+        if (wcscmp (fdata.cFileName, L".") == 0 ||
+            wcscmp (fdata.cFileName, L"..") == 0)
+            continue;
+
+        sub_path_w = g_new0 (wchar_t, path_len_w + wcslen(fdata.cFileName) + 2);
+        wcscpy (sub_path_w, path_w);
+        wcscat (sub_path_w, L"\\");
+        wcscat (sub_path_w, fdata.cFileName);
+
+        if (fdata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (check_dir_locked_recursive (sub_path_w)) {
+                ret = TRUE;
+                g_free (sub_path_w);
+                goto out;
+            }
+        } else {
+            if (check_file_locked (sub_path_w, FALSE)) {
+                ret = TRUE;
+                g_free (sub_path_w);
+                goto out;
+            }
+        }
+
+        g_free (sub_path_w);
+    } while (FindNextFileW (handle, &fdata) != 0);
+
+    error = GetLastError();
+    if (error != ERROR_NO_MORE_FILES) {
+        seaf_warning ("FindNextFile failed %s: %lu.\n",
+                      path, error);
+    }
+
+out:
+    FindClose (handle);
+    g_free (path);
+    g_free (pattern);
+    return ret;
+}
+
+gboolean
+do_check_dir_locked (const char *path, const char *worktree)
+{
+    char *real_path = g_build_path (PATH_SEPERATOR, worktree, path, NULL);
+    wchar_t *real_path_w = win32_long_path (real_path);
+    gboolean ret = check_dir_locked_recursive (real_path_w);
+    g_free (real_path);
+    g_free (real_path_w);
+    return ret;
 }
 
 gboolean
@@ -825,13 +1140,13 @@ files_locked_on_windows (struct index_state *index, const char *worktree)
                 mask == 6 ||    /* both added */
                 mask == 3)      /* others removed */
             {
-                if (do_check_file_locked (ce->name, worktree))
+                if (do_check_file_locked (ce->name, worktree, FALSE))
                     ret = TRUE;
                     break;
             }
         } else if (ce->ce_flags & CE_UPDATE ||
                    ce->ce_flags & CE_WT_REMOVE) {
-            if (do_check_file_locked (ce->name, worktree)) {
+            if (do_check_file_locked (ce->name, worktree, FALSE)) {
                 ret = TRUE;
                 break;
             }
@@ -854,7 +1169,7 @@ fill_seafile_blocks (const char *repo_id, int version,
     rawdata_to_hex (sha1, file_id, 20);
     seafile = seaf_fs_manager_get_seafile (seaf->fs_mgr, repo_id, version, file_id);
     if (!seafile) {
-        g_warning ("Failed to find file %s.\n", file_id);
+        seaf_warning ("Failed to find file %s.\n", file_id);
         return;
     }
 

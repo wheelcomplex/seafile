@@ -25,6 +25,7 @@ if sys.version_info[1] < 6:
     print 'Python 2.6 or above is required. Quit now.'
     sys.exit(1)
 
+import multiprocessing
 import os
 import glob
 import shutil
@@ -34,6 +35,7 @@ import optparse
 import atexit
 import csv
 
+error_exit = False
 ####################
 ### Global variables
 ####################
@@ -54,6 +56,12 @@ CONF_OUTPUTDIR          = 'outputdir'
 CONF_DEBUG              = 'debug'
 CONF_ONLY_CHINESE       = 'onlychinese'
 CONF_QT_ROOT            = 'qt_root'
+CONF_EXTRA_LIBS_DIR     = 'extra_libs_dir'
+CONF_QT5                = 'qt5'
+CONF_WITH_SHIB          = 'with_shib'
+CONF_BRAND              = 'brand'
+CONF_CERTFILE           = 'certfile'
+CONF_NO_STRIP           = 'nostrip'
 
 ####################
 ### Common helper functions
@@ -159,7 +167,11 @@ def run(cmdline, cwd=None, env=None, suppress_stdout=False, suppress_stderr=Fals
                                 stderr=stderr,
                                 env=env,
                                 shell=True)
-        return proc.wait()
+        ret = proc.wait()
+        if 'depend' not in cmdline and ret != 0:
+            global error_exit
+            error_exit = True
+        return ret
 
 def must_mkdir(path):
     '''Create a directory, exit on failure'''
@@ -243,12 +255,16 @@ class Project(object):
         '''Build the source'''
         self.before_build()
         info('Building %s' % self.name)
+        dump_env()
         for cmd in self.build_commands:
             if run(cmd, cwd=self.projdir) != 0:
                 error('error when running command:\n\t%s\n' % cmd)
 
 def get_make_path():
     return find_in_path('make.exe')
+
+def concurrent_make():
+    return '%s -j%s' % (get_make_path(), multiprocessing.cpu_count())
 
 class Libsearpc(Project):
     name = 'libsearpc'
@@ -257,7 +273,7 @@ class Libsearpc(Project):
         Project.__init__(self)
         self.build_commands = [
             'sh ./configure --prefix=%s --disable-compile-demo' % to_mingw_path(self.prefix),
-            get_make_path(),
+            concurrent_make(),
             '%s install' % get_make_path(),
         ]
 
@@ -271,7 +287,7 @@ class Ccnet(Project):
         Project.__init__(self)
         self.build_commands = [
             'sh ./configure --prefix=%s --disable-compile-demo' % to_mingw_path(self.prefix),
-            get_make_path(),
+            concurrent_make(),
             '%s install' % get_make_path(),
         ]
 
@@ -289,9 +305,10 @@ class Seafile(Project):
     name = 'seafile'
     def __init__(self):
         Project.__init__(self)
+        enable_breakpad = '--enable-breakpad'
         self.build_commands = [
-            'sh ./configure --prefix=%s' % to_mingw_path(self.prefix),
-            get_make_path(),
+            'sh ./configure %s --prefix=%s' % (enable_breakpad, to_mingw_path(self.prefix)),
+            concurrent_make(),
             '%s install' % get_make_path(),
         ]
 
@@ -308,17 +325,35 @@ class SeafileClient(Project):
     name = 'seafile-client'
     def __init__(self):
         Project.__init__(self)
+        ninja = find_in_path('ninja.exe')
+        seafile_prefix = Seafile().prefix
+        generator = 'Ninja' if ninja else 'MSYS Makefiles'
+        build_type = 'Debug' if conf[CONF_DEBUG] else 'Release'
+        flags = {
+            'BUILD_SPARKLE_SUPPORT': 'ON',
+            'USE_QT5': 'ON' if conf[CONF_QT5] else 'OFF',
+            'BUILD_SHIBBOLETH_SUPPORT': 'ON' if conf[CONF_WITH_SHIB] else 'OFF',
+            'CMAKE_BUILD_TYPE': build_type,
+            'CMAKE_INSTALL_PREFIX': to_mingw_path(self.prefix),
+            # ninja invokes cmd.exe which doesn't support msys/mingw path
+            # change the value but don't override CMAKE_EXE_LINKER_FLAGS,
+            # which is in use
+            'CMAKE_EXE_LINKER_FLAGS_%s' % build_type.upper(): '-L%s' % (os.path.join(seafile_prefix, 'lib') if ninja else to_mingw_path(os.path.join(seafile_prefix, 'lib'))),
+        }
+        flags_str = ' '.join(['-D%s=%s' % (k, v) for k, v in flags.iteritems()])
+        make = ninja or concurrent_make()
         self.build_commands = [
-            'cmake -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=%s .' % to_mingw_path(self.prefix),
-            get_make_path(),
-            '%s install' % get_make_path(),
+            'cmake -G "%s" %s .' % (generator, flags_str),
+            make,
+            '%s install' % make,
+            "bash extensions/build.sh",
         ]
 
     def get_version(self):
         return conf[CONF_SEAFILE_CLIENT_VERSION]
 
     def before_build(self):
-        pass
+        shutil.copy(os.path.join(conf[CONF_EXTRA_LIBS_DIR], 'winsparkle.lib'), self.projdir)
 
 def check_targz_src(proj, version, srcdir):
     src_tarball = os.path.join(srcdir, '%s-%s.tar.gz' % (proj, version))
@@ -334,6 +369,7 @@ def validate_args(usage, options):
         CONF_SEAFILE_CLIENT_VERSION,
         CONF_SRCDIR,
         CONF_QT_ROOT,
+        CONF_EXTRA_LIBS_DIR,
     ]
 
     # fist check required args
@@ -347,7 +383,7 @@ def validate_args(usage, options):
     # [ version ]
     def check_project_version(version):
         '''A valid version must be like 1.2.2, 1.3'''
-        if not re.match('^[0-9](\.[0-9])+$', version):
+        if not re.match('^[0-9]+(\.([0-9])+)+$', version):
             error('%s is not a valid version' % version, usage=usage)
 
     version = get_option(CONF_VERSION)
@@ -387,6 +423,9 @@ def validate_args(usage, options):
     # [ no strip]
     debug = get_option(CONF_DEBUG)
 
+    # [ no strip]
+    nostrip = get_option(CONF_NO_STRIP)
+
     # [only chinese]
     onlychinese = get_option(CONF_ONLY_CHINESE)
 
@@ -397,6 +436,23 @@ def validate_args(usage, options):
             error('%s is not a valid qt root' % qt_root)
     check_qt_root(qt_root)
 
+    # [ sparkle dir]
+    extra_libs_dir = get_option(CONF_EXTRA_LIBS_DIR)
+    def check_extra_libs_dir(extra_libs_dir):
+        for fn in ['winsparkle.lib']:
+            if not os.path.exists(os.path.join(extra_libs_dir, fn)):
+                error('%s is missing in %s' % (fn, extra_libs_dir))
+    check_extra_libs_dir(extra_libs_dir)
+
+    # [qt5]
+    qt5 = get_option(CONF_QT5)
+    with_shib = get_option(CONF_WITH_SHIB)
+    brand = get_option(CONF_BRAND)
+    cert = get_option(CONF_CERTFILE)
+    if cert is not None:
+        if not os.path.exists(cert):
+            error('cert file "{}" does not exist'.format(cert))
+
     conf[CONF_VERSION] = version
     conf[CONF_LIBSEARPC_VERSION] = libsearpc_version
     conf[CONF_CCNET_VERSION] = ccnet_version
@@ -406,10 +462,16 @@ def validate_args(usage, options):
     conf[CONF_BUILDDIR] = builddir
     conf[CONF_SRCDIR] = srcdir
     conf[CONF_OUTPUTDIR] = outputdir
-    conf[CONF_KEEP] = keep
-    conf[CONF_DEBUG] = debug
+    conf[CONF_KEEP] = True
+    conf[CONF_DEBUG] = debug or nostrip
+    conf[CONF_NO_STRIP] = debug or nostrip
     conf[CONF_ONLY_CHINESE] = onlychinese
     conf[CONF_QT_ROOT] = qt_root
+    conf[CONF_EXTRA_LIBS_DIR] = extra_libs_dir
+    conf[CONF_QT5] = qt5
+    conf[CONF_WITH_SHIB] = with_shib
+    conf[CONF_BRAND] = brand
+    conf[CONF_CERTFILE] = cert
 
     prepare_builddir(builddir)
     show_build_info()
@@ -442,8 +504,9 @@ def prepare_builddir(builddir):
     if not conf[CONF_KEEP]:
         def remove_builddir():
             '''Remove the builddir when exit'''
-            info('remove builddir before exit')
-            shutil.rmtree(builddir, ignore_errors=True)
+            if not error_exit:
+                info('remove builddir before exit')
+                shutil.rmtree(builddir, ignore_errors=True)
         atexit.register(remove_builddir)
 
     os.chdir(builddir)
@@ -500,6 +563,11 @@ def parse_args():
                       nargs=1,
                       help='''qt root directory.''')
 
+    parser.add_option(long_opt(CONF_EXTRA_LIBS_DIR),
+                      dest=CONF_EXTRA_LIBS_DIR,
+                      nargs=1,
+                      help='''where we can find winsparkle.lib''')
+
     parser.add_option(long_opt(CONF_KEEP),
                       dest=CONF_KEEP,
                       action='store_true',
@@ -514,6 +582,32 @@ def parse_args():
                       dest=CONF_ONLY_CHINESE,
                       action='store_true',
                       help='''only build the Chinese version. By default both Chinese and English versions would be built.''')
+
+    parser.add_option(long_opt(CONF_QT5),
+                      dest=CONF_QT5,
+                      action='store_true',
+                      help='''build seafile client with qt5''')
+
+    parser.add_option(long_opt(CONF_WITH_SHIB),
+                      dest=CONF_WITH_SHIB,
+                      action='store_true',
+                      help='''build seafile client with shibboleth support''')
+
+    parser.add_option(long_opt(CONF_BRAND),
+                      dest=CONF_BRAND,
+                      default='seafile',
+                      help='''brand name of the package''')
+
+    parser.add_option(long_opt(CONF_CERTFILE),
+                      nargs=1,
+                      default=None,
+                      dest=CONF_CERTFILE,
+                      help='''The cert for signing the executables and the installer.''')
+
+    parser.add_option(long_opt(CONF_NO_STRIP),
+                      dest=CONF_NO_STRIP,
+                      action='store_true',
+                      help='''do not strip the symbols.''')
 
     usage = parser.format_help()
     options, remain = parser.parse_args()
@@ -548,7 +642,8 @@ def setup_build_env():
                       seperator=';')
 
     prepend_env_value('PKG_CONFIG_PATH',
-                      os.path.join(prefix, 'lib', 'pkgconfig'))
+                      os.path.join(prefix, 'lib', 'pkgconfig'),
+                      seperator=';')
                       # to_mingw_path(os.path.join(prefix, 'lib', 'pkgconfig')))
 
     # specifiy the directory for wix temporary files
@@ -632,26 +727,55 @@ def copy_dll_exe():
         os.path.join(prefix, 'bin', 'libseafile-0.dll'),
         os.path.join(prefix, 'bin', 'ccnet.exe'),
         os.path.join(prefix, 'bin', 'seaf-daemon.exe'),
-        os.path.join(SeafileClient().projdir, 'seafile-applet.exe')
+        os.path.join(SeafileClient().projdir, 'seafile-applet.exe'),
     ]
 
     for name in filelist:
         must_copy(name, destdir)
 
+    extdlls = [
+        os.path.join(SeafileClient().projdir, 'extensions', 'lib', 'seafile_shell_ext.dll'),
+        os.path.join(SeafileClient().projdir, 'extensions', 'lib', 'seafile_shell_ext64.dll'),
+    ]
+
+    customdir = os.path.join(conf[CONF_BUILDDIR], 'pack', 'custom')
+    for dll in extdlls:
+        must_copy(dll, customdir)
+
     copy_shared_libs([ f for f in filelist if f.endswith('.exe') ])
-    copy_qt_plugins()
+    copy_qt_plugins_imageformats()
+    copy_qt_plugins_platforms()
     copy_qt_translations()
 
-def copy_qt_plugins():
+def copy_qt_plugins_imageformats():
     destdir = os.path.join(conf[CONF_BUILDDIR], 'pack', 'bin', 'imageformats')
     must_mkdir(destdir)
 
     qt_plugins_srcdir = os.path.join(conf[CONF_QT_ROOT], 'plugins', 'imageformats')
 
     src = os.path.join(qt_plugins_srcdir, 'qico4.dll')
+    if conf[CONF_QT5]:
+        src = os.path.join(qt_plugins_srcdir, 'qico.dll')
     must_copy(src, destdir)
 
     src = os.path.join(qt_plugins_srcdir, 'qgif4.dll')
+    if conf[CONF_QT5]:
+        src = os.path.join(qt_plugins_srcdir, 'qgif.dll')
+    must_copy(src, destdir)
+
+def copy_qt_plugins_platforms():
+    if not conf[CONF_QT5]:
+        return
+
+    destdir = os.path.join(conf[CONF_BUILDDIR], 'pack', 'bin', 'platforms')
+    must_mkdir(destdir)
+
+    qt_plugins_srcdir = os.path.join(conf[CONF_QT_ROOT], 'plugins', 'platforms')
+
+    src = os.path.join(qt_plugins_srcdir, 'qwindows.dll')
+    must_copy(src, destdir)
+
+    src = os.path.join(qt_plugins_srcdir, 'qminimal.dll')
     must_copy(src, destdir)
 
 def copy_qt_translations():
@@ -689,18 +813,61 @@ def prepare_msi():
     must_copytree(msi_dir, pack_dir)
     must_mkdir(os.path.join(pack_dir, 'bin'))
 
+    if run('make', cwd=os.path.join(pack_dir, 'custom')) != 0:
+        error('Error when compiling seafile msi custom dlls')
+
     copy_dll_exe()
+
+def sign_executables():
+    certfile = conf.get(CONF_CERTFILE)
+    if certfile is None:
+        info('exectuable signing is skipped since no cert is provided.')
+        return
+
+    pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
+    exectuables = glob.glob(os.path.join(pack_dir, 'bin', '*.exe'))
+    for exe in exectuables:
+        do_sign(certfile, exe)
+
+def sign_installers():
+    certfile = conf.get(CONF_CERTFILE)
+    if certfile is None:
+        info('msi signing is skipped since no cert is provided.')
+        return
+
+    pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
+    installers = glob.glob(os.path.join(pack_dir, '*.msi'))
+    for fn in installers:
+        do_sign(certfile, fn, desc='Seafile Installer')
+
+def do_sign(certfile, fn, desc=None):
+    certfile = to_win_path(certfile)
+    fn = to_win_path(fn)
+    info('signing file {} using cert "{}"'.format(fn, certfile))
+
+    if desc:
+        desc_flags = '-d "{}"'.format(desc)
+    else:
+        desc_flags = ''
+
+    signcmd = 'signtool.exe sign -fd sha256 -t http://timestamp.digicert.com -f {} {} {}'.format(certfile, desc_flags, fn)
+    if run(signcmd, cwd=os.path.dirname(fn)) != 0:
+        error('Failed to sign file "{}"'.format(fn))
 
 def strip_symbols():
     bin_dir = os.path.join(conf[CONF_BUILDDIR], 'pack', 'bin')
-    def do_strip(fn):
-        run('strip "%s"' % fn)
+    def do_strip(fn, stripcmd='strip'):
+        run('%s "%s"' % (stripcmd, fn))
         info('stripping: %s' % fn)
 
     for dll in glob.glob(os.path.join(bin_dir, '*.dll')):
         name = os.path.basename(dll).lower()
         if 'qt' in name:
             do_strip(dll)
+        if name == 'seafile_shell_ext.dll':
+            do_strip(dll)
+        elif name == 'seafile_shell_ext64.dll':
+            do_strip(dll, stripcmd='x86_64-w64-mingw32-strip')
 
 def edit_fragment_wxs():
     '''In the main wxs file(seafile.wxs) we need to reference to the id of
@@ -724,9 +891,32 @@ def edit_fragment_wxs():
     with open(file_path, 'w') as fp:
         fp.write(content)
 
+def generate_breakpad_symbols():
+    seafiledir = Seafile().projdir
+    script = os.path.join(seafiledir, 'scripts/breakpad.py')
+    symbol_file = 'seaf-daemon.exe.sym-%s' % conf[CONF_VERSION]
+    output = os.path.join(seafiledir, symbol_file)
+
+    # generate the breakpad symbols
+    if run('python %s --output %s' % (script, output)) != 0:
+        error('Error when generating breakpad symbols')
+
+    # move symbols to output directory
+    dst_symbol_file = os.path.join(conf[CONF_OUTPUTDIR], symbol_file)
+    must_copy(output, dst_symbol_file)
+
 def build_msi():
     prepare_msi()
-    strip_symbols()
+    generate_breakpad_symbols()
+    if conf[CONF_DEBUG] or conf[CONF_NO_STRIP]:
+        info('Would not strip exe/dll symbols since --debug or --nostrip is specified')
+    else:
+        strip_symbols()
+
+    # Only sign the exectuables after stripping symbols.
+    if need_sign():
+        sign_executables()
+
     pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
     if run('make fragment.wxs', cwd=pack_dir) != 0:
         error('Error when make fragement.wxs')
@@ -753,17 +943,27 @@ def build_german_msi():
 def move_msi():
     pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
     src_msi = os.path.join(pack_dir, 'seafile.msi')
-    dst_msi = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s.msi' % conf[CONF_VERSION])
+    brand = conf[CONF_BRAND]
+    if not conf[CONF_WITH_SHIB]:
+        dst_msi = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s.msi' % (brand, conf[CONF_VERSION]))
+    else:
+        dst_msi = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-shibboleth.msi' % (brand, conf[CONF_VERSION]))
 
     # move msi to outputdir
     must_copy(src_msi, dst_msi)
 
     if not conf[CONF_ONLY_CHINESE]:
         src_msi_en = os.path.join(pack_dir, 'seafile-en.msi')
-        dst_msi_en = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s-en.msi' % conf[CONF_VERSION])
+        if not conf[CONF_WITH_SHIB]:
+            dst_msi_en = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-en.msi' % (brand, conf[CONF_VERSION]))
+        else:
+            dst_msi_en = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-en-shibboleth.msi' % (brand, conf[CONF_VERSION]))
         must_copy(src_msi_en, dst_msi_en)
         src_msi_de = os.path.join(pack_dir, 'seafile-de.msi')
-        dst_msi_de = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s-de.msi' % conf[CONF_VERSION])
+        if not conf[CONF_WITH_SHIB]:
+            dst_msi_de = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-de.msi' % (brand, conf[CONF_VERSION]))
+        else:
+            dst_msi_de = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-de-shibboleth.msi' % (brand, conf[CONF_VERSION]))
         must_copy(src_msi_de, dst_msi_de)
 
     print '---------------------------------------------'
@@ -786,7 +986,16 @@ def check_tools():
         if not find_in_path(prog + '.exe'):
             error('%s not found' % prog)
 
+def dump_env():
+    print 'Dumping environment variables:'
+    for k, v in os.environ.iteritems():
+        print '%s: %s' % (k, v)
+
+def need_sign():
+    return conf[CONF_BRAND].lower() == 'seafile'
+
 def main():
+    dump_env()
     parse_args()
     setup_build_env()
     check_tools()
@@ -813,6 +1022,8 @@ def main():
         build_english_msi()
         build_german_msi()
 
+    if need_sign():
+        sign_installers()
     move_msi()
 
 if __name__ == '__main__':

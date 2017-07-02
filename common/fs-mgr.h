@@ -15,6 +15,10 @@
 #define CURRENT_DIR_OBJ_VERSION 1
 #define CURRENT_SEAFILE_OBJ_VERSION 1
 
+#define CDC_AVERAGE_BLOCK_SIZE (1 << 23) /* 8MB */
+#define CDC_MIN_BLOCK_SIZE (6 * (1 << 20)) /* 6MB */
+#define CDC_MAX_BLOCK_SIZE (10 * (1 << 20)) /* 10MB */
+
 typedef struct _SeafFSManager SeafFSManager;
 typedef struct _SeafFSObject SeafFSObject;
 typedef struct _Seafile Seafile;
@@ -179,7 +183,8 @@ seaf_fs_manager_checkout_file (SeafFSManager *mgr,
                                const char *in_repo_path,
                                const char *conflict_head_id,
                                gboolean force_conflict,
-                               gboolean *conflicted);
+                               gboolean *conflicted,
+                               const char *email);
 
 #endif  /* not SEAFILE_SERVER */
 
@@ -197,6 +202,20 @@ seaf_fs_manager_index_file_blocks (SeafFSManager *mgr,
                                    gint64 file_size);
 
 int
+seaf_fs_manager_index_raw_blocks (SeafFSManager *mgr,
+                                  const char *repo_id,
+                                  int version,
+                                  GList *paths,
+                                  GList *blockids);
+
+int
+seaf_fs_manager_index_existed_file_blocks (SeafFSManager *mgr,
+                                           const char *repo_id,
+                                           int version,
+                                           GList *blockids,
+                                           unsigned char sha1[],
+                                           gint64 file_size);
+int
 seaf_fs_manager_index_blocks (SeafFSManager *mgr,
                               const char *repo_id,
                               int version,
@@ -204,7 +223,8 @@ seaf_fs_manager_index_blocks (SeafFSManager *mgr,
                               unsigned char sha1[],
                               gint64 *size,
                               SeafileCrypt *crypt,
-                              gboolean write_data);
+                              gboolean write_data,
+                              gboolean use_cdc);
 
 Seafile *
 seaf_fs_manager_get_seafile (SeafFSManager *mgr,
@@ -225,6 +245,13 @@ seaf_fs_manager_get_seafdir_sorted (SeafFSManager *mgr,
                                     const char *repo_id,
                                     int version,
                                     const char *dir_id);
+
+SeafDir *
+seaf_fs_manager_get_seafdir_sorted_by_path (SeafFSManager *mgr,
+                                            const char *repo_id,
+                                            int version,
+                                            const char *root_id,
+                                            const char *path);
 
 int
 seaf_fs_manager_populate_blocklist (SeafFSManager *mgr,
@@ -253,8 +280,29 @@ seaf_fs_manager_traverse_tree (SeafFSManager *mgr,
                                void *user_data,
                                gboolean skip_errors);
 
+typedef gboolean (*TraverseFSPathCallback) (SeafFSManager *mgr,
+                                            const char *path,
+                                            SeafDirent *dent,
+                                            void *user_data,
+                                            gboolean *stop);
+
+int
+seaf_fs_manager_traverse_path (SeafFSManager *mgr,
+                               const char *repo_id,
+                               int version,
+                               const char *root_id,
+                               const char *dir_path,
+                               TraverseFSPathCallback callback,
+                               void *user_data);
+
 gboolean
 seaf_fs_manager_object_exists (SeafFSManager *mgr,
+                               const char *repo_id,
+                               int version,
+                               const char *id);
+
+void
+seaf_fs_manager_delete_object (SeafFSManager *mgr,
                                const char *repo_id,
                                int version,
                                const char *id);
@@ -326,6 +374,14 @@ seaf_fs_manager_get_seafdir_id_by_path (SeafFSManager *mgr,
                                         const char *path,
                                         GError **error);
 
+SeafDirent *
+seaf_fs_manager_get_dirent_by_path (SeafFSManager *mgr,
+                                    const char *repo_id,
+                                    int version,
+                                    const char *root_id,
+                                    const char *path,
+                                    GError **error);
+
 /* Check object integrity. */
 
 gboolean
@@ -363,5 +419,9 @@ void
 seaf_fs_manager_calculate_seafile_id_json (int repo_version,
                                            struct _CDCFileDescriptor *cdc,
                                            guint8 *file_id_sha1);
+
+int
+seaf_fs_manager_remove_store (SeafFSManager *mgr,
+                              const char *store_id);
 
 #endif

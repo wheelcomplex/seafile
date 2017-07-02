@@ -19,12 +19,20 @@ struct _SyncInfo {
     gboolean   in_sync;         /* set to FALSE when sync state is DONE or ERROR */
 
     gint       err_cnt;
+    gboolean   in_error;        /* set to TRUE if err_cnt >= 3 */
+
     gboolean   deleted_on_relay;
     gboolean   branch_deleted_on_relay;
     gboolean   repo_corrupted;
     gboolean   need_fetch;
     gboolean   need_upload;
     gboolean   need_merge;
+
+    /* Used by multipart upload. */
+    gboolean   multipart_upload;
+    gint64     total_bytes;
+    gint64     uploaded_bytes;
+    gboolean   end_multipart_upload;
 };
 
 enum {
@@ -61,6 +69,8 @@ enum {
     SYNC_ERROR_MERGE,
     SYNC_ERROR_WORKTREE_DIRTY,
     SYNC_ERROR_DEPRECATED_SERVER,
+    SYNC_ERROR_GET_SYNC_INFO,   /* for http sync */
+    SYNC_ERROR_FILES_LOCKED,
     SYNC_ERROR_UNKNOWN,
     SYNC_ERROR_NUM,
 };
@@ -73,6 +83,7 @@ struct _SyncTask {
     gboolean         is_initial_commit;
     int              state;
     int              error;
+    char            *err_detail;
     char            *tx_id;
     char            *token;
     struct CcnetTimer *commit_timer;
@@ -80,21 +91,25 @@ struct _SyncTask {
     gboolean         server_side_merge;
     gboolean         uploaded;
 
+    gboolean         http_sync;
+    int              http_version;
+
     SeafRepo        *repo;  /* for convenience, only valid when in_sync. */
 };
 
-enum {
-    SERVER_SIDE_MERGE_UNKNOWN = 0,
-    SERVER_SIDE_MERGE_SUPPORTED,
-    SERVER_SIDE_MERGE_UNSUPPORTED,
+enum _SyncStatus {
+    SYNC_STATUS_NONE = 0,
+    SYNC_STATUS_SYNCING,
+    SYNC_STATUS_ERROR,
+    SYNC_STATUS_IGNORED,
+    SYNC_STATUS_SYNCED,
+    SYNC_STATUS_PAUSED,
+    SYNC_STATUS_READONLY,
+    SYNC_STATUS_LOCKED,
+    SYNC_STATUS_LOCKED_BY_ME,
+    N_SYNC_STATUS,
 };
-
-struct _ServerState {
-    int server_side_merge;
-    gboolean checking;
-};
-
-typedef struct _ServerState ServerState;
+typedef enum _SyncStatus SyncStatus;
 
 struct _SeafileSession;
 
@@ -107,6 +122,19 @@ struct _SeafSyncManager {
     int         sync_interval;
 
     GHashTable *server_states;
+    GHashTable *http_server_states;
+
+    /* Sent/recv bytes from all transfer tasks in this second.
+     * Since we have http and non-http tasks, sync manager is
+     * the only reasonable place to put these variables.
+     */
+    gint             sent_bytes;
+    gint             recv_bytes;
+    gint             last_sent_bytes;
+    gint             last_recv_bytes;
+    /* Upload/download rate limits. */
+    gint             upload_limit;
+    gint             download_limit;
 
     SeafSyncManagerPriv *priv;
 };
@@ -144,4 +172,42 @@ sync_error_to_str (int error);
 
 const char *
 sync_state_to_str (int state);
+
+void
+seaf_sync_manager_update_active_path (SeafSyncManager *mgr,
+                                      const char *repo_id,
+                                      const char *path,
+                                      int mode,
+                                      SyncStatus status);
+
+void
+seaf_sync_manager_delete_active_path (SeafSyncManager *mgr,
+                                      const char *repo_id,
+                                      const char *path);
+
+char *
+seaf_sync_manager_get_path_sync_status (SeafSyncManager *mgr,
+                                        const char *repo_id,
+                                        const char *path,
+                                        gboolean is_dir);
+
+char *
+seaf_sync_manager_list_active_paths_json (SeafSyncManager *mgr);
+
+int
+seaf_sync_manager_active_paths_number (SeafSyncManager *mgr);
+
+void
+seaf_sync_manager_remove_active_path_info (SeafSyncManager *mgr, const char *repo_id);
+
+#ifdef WIN32
+/* Add to refresh queue */
+void
+seaf_sync_manager_add_refresh_path (SeafSyncManager *mgr, const char *path);
+
+/* Refresh immediately. */
+void
+seaf_sync_manager_refresh_path (SeafSyncManager *mgr, const char *path);
+#endif
+
 #endif

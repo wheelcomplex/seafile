@@ -2,14 +2,15 @@ dnl Process this file with autoconf to produce a configure script.
 
 
 AC_PREREQ(2.61)
-AC_INIT([seafile], [3.1.5], [freeplant@gmail.com])
+AC_INIT([seafile], [6.0.7], [info@seafile.com])
 AC_CONFIG_HEADER([config.h])
 
 AC_CONFIG_MACRO_DIR([m4])
 
 AM_INIT_AUTOMAKE([1.9 foreign])
 
-AC_MINGW32
+#AC_MINGW32
+AC_CANONICAL_BUILD
 
 dnl enable the build of share library by default
 AC_ENABLE_SHARED
@@ -35,9 +36,9 @@ AC_SYS_LARGEFILE
 
 # check platform
 AC_MSG_CHECKING(for WIN32)
-if test "$MINGW32" = yes; then
+if test "$build_os" = "mingw32" -o "$build_os" = "mingw64"; then
   bwin32=true
-  AC_MSG_RESULT(compile in mingw32)
+  AC_MSG_RESULT(compile in mingw)
 else
   AC_MSG_RESULT(no)
 fi
@@ -58,94 +59,6 @@ else
   AC_MSG_RESULT(no)
 fi
 
-# test which sub-component to compile
-
-if test "$bwin32" = true; then
-   compile_client=yes
-   compile_cli=no
-   compile_tools=no
-   compile_server=no
-fi
-
-if test "$bmac" = true; then
-   compile_client=yes
-   compile_cli=no
-   compile_tools=no
-   compile_server=no
-fi
-
-if test "$blinux" = true; then
-   compile_cli=yes
-   compile_tools=yes
-
-   compile_server=no
-
-#   AC_ARG_ENABLE(seablock, AC_HELP_STRING([--enable-seablock],
-#      [enable seablock]), [compile_seablock=$enableval],
-#      [compile_seablock="no"])
-
-   AC_ARG_ENABLE(riak, AC_HELP_STRING([--enable-riak], [enable riak backend]),
-      [compile_riak=$enableval],[compile_riak="no"])
-fi
-
-if test "$bwin32" != true; then
-   AC_ARG_ENABLE(fuse, AC_HELP_STRING([--enable-fuse], [enable fuse virtual file system]),
-      [compile_fuse=$enableval],[compile_fuse="yes"])
-fi
-
-AC_ARG_ENABLE(client, AC_HELP_STRING([--enable-client], [enable client]),
-   [compile_client=$enableval],[compile_client="yes"])
-
-AC_ARG_ENABLE(server, AC_HELP_STRING([--enable-server], [enable server]),
-   [compile_server=$enableval],[compile_server="no"])
-
-AC_ARG_ENABLE(python,
-              AC_HELP_STRING([--enable-python],[build ccnet python binding]),
-              [compile_python=$enableval],
-              [compile_python=yes])
-
-
-AC_ARG_ENABLE(server-pkg, AC_HELP_STRING([--enable-server-pkg], [enable static compile]),
-    [server_pkg=$enableval],[server_pkg="no"])
-
-AM_CONDITIONAL([SERVER_ONLY], [test "${server_pkg}" = "yes"])
-
-
-AC_ARG_ENABLE(static-build, AC_HELP_STRING([--enable-static-build], [enable static compile]),
-    [static_comp=$enableval],[static_comp="no"])
-
-if test x${static_comp} = xyes; then
-  STATIC_COMPILE=-static
-fi
-AC_SUBST(STATIC_COMPILE)
-
-
-# If we're building server release package, set the run-time path
-# for the executables. So that the loader will lookup shared libs
-# in 'lib' dir of the release package.
-# Read "man ld.so" for description of $ORIGIN.
-# Refer to http://blog.linuxgamepublishing.com/2009/02/08/our-new-way-to-meet-the-lgpl/
-if test x${server_pkg} = xyes; then
-  compile_client=no
-  compile_cli=yes
-  compile_tools=yes
-  compile_server=yes
-  SERVER_PKG_RPATH=-Wl,-R,\'\$\$ORIGIN/../lib\'
-  SERVER_PKG_PY_RPATH=-Wl,-R,\'\$\$ORIGIN/../../..\'
-fi
-AC_SUBST(SERVER_PKG_RPATH)
-AC_SUBST(SERVER_PKG_PY_RPATH)
-
-
-AM_CONDITIONAL([COMPILE_CLI], [test "${compile_cli}" = "yes"])
-AM_CONDITIONAL([COMPILE_TOOLS], [test "${compile_tools}" = "yes"])
-AM_CONDITIONAL([COMPILE_PYTHON], [test "${compile_python}" = "yes"])
-AM_CONDITIONAL([COMPILE_CLIENT], [test "${compile_client}" = "yes"])
-AM_CONDITIONAL([COMPILE_SERVER], [test "${compile_server}" = "yes"])
-#AM_CONDITIONAL([COMPILE_SEABLOCK], [test "${compile_seablock}" = "yes"])
-AM_CONDITIONAL([COMPILE_RIAK], [test "${compile_riak}" = "yes"])
-AM_CONDITIONAL([COMPILE_FUSE], [test "${compile_fuse}" = "yes"])
-
 AM_CONDITIONAL([WIN32], [test "$bwin32" = "true"])
 AM_CONDITIONAL([MACOS], [test "$bmac" = "true"])
 AM_CONDITIONAL([LINUX], [test "$blinux" = "true"])
@@ -164,7 +77,6 @@ fi
 
 AC_CHECK_LIB(pthread, pthread_create, [echo "found library pthread"], AC_MSG_ERROR([*** Unable to find pthread library]), )
 AC_CHECK_LIB(sqlite3, sqlite3_open,[echo "found library sqlite3"] , AC_MSG_ERROR([*** Unable to find sqlite3 library]), )
-AC_CHECK_LIB(crypto, SHA1_Init, [echo "found library crypto"], AC_MSG_ERROR([*** Unable to find openssl crypto library]), )
 
 dnl Do we need to use AX_LIB_SQLITE3 to check sqlite?
 dnl AX_LIB_SQLITE3
@@ -192,6 +104,7 @@ if test "$bwin32" = true; then
   LIB_PSAPI=-lpsapi
   LIB_MAC=
   MSVC_CFLAGS="-D__MSVCRT__ -D__MSVCRT_VERSION__=0x0601"
+  LIB_CRYPT32=-lcrypt32
 elif test "$bmac" = true ; then
   LIB_WS32=
   LIB_GDI32=
@@ -204,6 +117,8 @@ elif test "$bmac" = true ; then
   LIB_PSAPI=
   MSVC_CFLAGS=
   LIB_MAC="-framework CoreServices"
+  LIB_CRYPT32=
+  LIB_ICONV=-liconv
 else
   LIB_WS32=
   LIB_GDI32=
@@ -216,6 +131,7 @@ else
   LIB_PSAPI=
   LIB_MAC=
   MSVC_CFLAGS=
+  LIB_CRYPT32=
 fi
 
 AC_SUBST(LIB_WS32)
@@ -229,6 +145,8 @@ AC_SUBST(LIB_SHELL32)
 AC_SUBST(LIB_PSAPI)
 AC_SUBST(LIB_MAC)
 AC_SUBST(MSVC_CFLAGS)
+AC_SUBST(LIB_CRYPT32)
+AC_SUBST(LIB_ICONV)
 
 
 LIBEVENT_REQUIRED=2.0
@@ -236,15 +154,9 @@ GLIB_REQUIRED=2.16.0
 CCNET_REQUIRED=0.9.3
 SEARPC_REQUIRED=1.0
 JANSSON_REQUIRED=2.2.1
-ZDB_REQUIRED=2.10
-#LIBNAUTILUS_EXTENSION_REQUIRED=2.30.1
 CURL_REQUIRED=7.17
-FUSE_REQUIRED=2.7.3
 ZLIB_REQUIRED=1.2.0
-
-PKG_CHECK_MODULES(SSL, [openssl])
-AC_SUBST(SSL_CFLAGS)
-AC_SUBST(SSL_LIBS)
+GNUTLS_REQUIRED=3.3.0
 
 PKG_CHECK_MODULES(GLIB2, [glib-2.0 >= $GLIB_REQUIRED])
 AC_SUBST(GLIB2_CFLAGS)
@@ -274,56 +186,55 @@ PKG_CHECK_MODULES(ZLIB, [zlib >= $ZLIB_REQUIRED])
 AC_SUBST(ZLIB_CFLAGS)
 AC_SUBST(ZLIB_LIBS)
 
-if test x${compile_python} = xyes; then
-   AM_PATH_PYTHON([2.6])
+PKG_CHECK_MODULES(CURL, [libcurl >= $CURL_REQUIRED])
+AC_SUBST(CURL_CFLAGS)
+AC_SUBST(CURL_LIBS)
 
-   if test "$bwin32" = true; then
-       # set pyexecdir to somewhere like /c/Python26/Lib/site-packages
-       pyexecdir=${PYTHON_DIR}/Lib/site-packages
-       pythondir=${pyexecdir}
-       pkgpyexecdir=${pyexecdir}/${PACKAGE}
-       pkgpythondir=${pythondir}/${PACKAGE}
+AM_PATH_PYTHON([2.6])
 
-   fi # end for bwin32
+if test "$bwin32" = true; then
+    # set pyexecdir to somewhere like /c/Python26/Lib/site-packages
+    pyexecdir=${PYTHON_DIR}/Lib/site-packages
+    pythondir=${pyexecdir}
+    pkgpyexecdir=${pyexecdir}/${PACKAGE}
+    pkgpythondir=${pythondir}/${PACKAGE}
 
+fi # end for bwin32
+
+
+BPWRAPPER_REQUIRED=0.1
+AC_ARG_ENABLE(breakpad, AC_HELP_STRING([--enable-breakpad], [build google breadpad support]),
+                               [compile_breakpad=$enableval],[compile_breakpad="no"])
+
+AM_CONDITIONAL([HAVE_BREAKPAD_SUPPORT], [test "${compile_breakpad}" = "yes"])
+if test "${compile_breakpad}" = "yes"; then
+   PKG_CHECK_MODULES(BPWRAPPER, [bpwrapper])
+   AC_DEFINE(HAVE_BREAKPAD_SUPPORT, 1, [Breakpad support enabled])
+   AC_SUBST(BPWRAPPER_CFLAGS)
+   AC_SUBST(BPWRAPPER_LIBS)
 fi
 
+AC_ARG_WITH([gpl-crypto],
+            AS_HELP_STRING([--with-gpl-crypto=[yes|no]],
+                [Use GPL compatible crypto libraries. Default no.]),
+            [ gpl_crypto=$with_gpl_crypto ],
+            [ gpl_crypto="no"])
+if test "xyes" = "x$gpl_crypto"; then
+   PKG_CHECK_MODULES(GNUTLS, [gnutls >= $GNUTLS_REQUIRED])
+   AC_SUBST(GNUTLS_CFLAGS)
+   AC_SUBST(GNUTLS_LIBS)
 
-# Check libzdb if compile seafile server
-if test "${compile_server}" = "yes"; then
-   PKG_CHECK_MODULES(ZDB, [zdb >= $ZDB_REQUIRED])
-   AC_SUBST(ZDB_CFLAGS)
-   AC_SUBST(ZDB_LIBS)
-fi
+   PKG_CHECK_MODULES(NETTLE, [nettle])
+   AC_SUBST(NETTLE_CFLAGS)
+   AC_SUBST(NETTLE_LIBS)
 
-if test "${compile_fuse}" = "yes"; then
-   PKG_CHECK_MODULES(FUSE, [fuse >= $FUSE_REQUIRED])
-   AC_SUBST(FUSE_CFLAGS)
-   AC_SUBST(FUSE_LIBS)
-fi
+   AC_DEFINE(USE_GPL_CRYPTO, 1, [Use GPL-compatible crypto libraries])
+else
+   AC_CHECK_LIB(crypto, SHA1_Init, [echo "found library crypto"], AC_MSG_ERROR([*** Unable to find openssl crypto library]), )
 
-if test x${compile_server} = xyes; then
-   dnl check libarchive
-   LIBARCHIVE_REQUIRED=2.8.5
-   PKG_CHECK_MODULES(LIBARCHIVE, [libarchive >= $LIBARCHIVE_REQUIRED])
-   AC_SUBST(LIBARCHIVE_CFLAGS)
-   AC_SUBST(LIBARCHIVE_LIBS)
-fi
-
-# We use http to communicate with Riak, check for libcurl.
-if test "${compile_riak}" = "yes"; then
-   PKG_CHECK_MODULES(CURL, [libcurl >= $CURL_REQUIRED])
-   AC_SUBST(CURL_CFLAGS)
-   AC_SUBST(CURL_LIBS)
-   AC_DEFINE([RIAK_BACKEND], [1], ["define if support Riak backend"])
-fi
-
-AM_CONDITIONAL([HAVE_KEYSTORAGE_GK], [test "${compile_gnome_keyring}" = "yes"])
-if test "${compile_gnome_keyring}" = "yes"; then
-   PKG_CHECK_MODULES(GNOME_KEYRING, [gnome-keyring-1])
-   AC_SUBST(GNOME_KEYRING_CFLAGS)
-   AC_SUBST(GNOME_KEYRING_LIBS)
-   AC_DEFINE(HAVE_KEYSTORAGE_GK, 1, [Have Gnome-Keyring support])
+   PKG_CHECK_MODULES(SSL, [openssl])
+   AC_SUBST(SSL_CFLAGS)
+   AC_SUBST(SSL_LIBS)
 fi
 
 ac_configure_args="$ac_configure_args -q"
@@ -331,38 +242,16 @@ ac_configure_args="$ac_configure_args -q"
 AC_CONFIG_FILES(
     Makefile
     include/Makefile
-    fuse/Makefile
     lib/Makefile
     lib/libseafile.pc
     common/Makefile
     common/cdc/Makefile
     common/index/Makefile
     daemon/Makefile
-    server/Makefile
-    server/gc/Makefile
     app/Makefile
+    doc/Makefile
     python/Makefile
     python/seafile/Makefile
-    python/seaserv/Makefile
-    controller/Makefile
-    fileserver/Makefile
-    tools/Makefile
-    tests/Makefile
-    tests/common-conf.sh
-    doc/Makefile
 )
 
 AC_OUTPUT
-
-
-echo
-echo "The following modules will be built:"
-echo
-if test x${compile_client} = xyes; then
-    echo "seaf-daemon"
-fi
-if test x${compile_server} = xyes; then
-   echo    "seaf-server"
-fi
-
-echo

@@ -280,7 +280,7 @@ def validate_args(usage, options):
     # [ version ]
     def check_project_version(version):
         '''A valid version must be like 1.2.2, 1.3'''
-        if not re.match('^[0-9](\.[0-9])+$', version):
+        if not re.match('^[0-9]+(\.([0-9])+)+$', version):
             error('%s is not a valid version' % version, usage=usage)
 
     version = get_option(CONF_VERSION)
@@ -331,7 +331,7 @@ def validate_args(usage, options):
     conf[CONF_BUILDDIR] = builddir
     conf[CONF_SRCDIR] = srcdir
     conf[CONF_OUTPUTDIR] = outputdir
-    conf[CONF_KEEP] = keep
+    conf[CONF_KEEP] = True
     conf[CONF_NO_STRIP] = nostrip
 
     prepare_builddir(builddir)
@@ -443,6 +443,9 @@ def setup_build_env():
         prepend_env_value('DEB_CPPFLAGS_APPEND',
                          '-g -O0',
                          seperator=' ')
+        os.environ['SEAFILE_NOSTRIP'] = 'true'
+        os.environ['DEB_CFLAGS_SET'] = ''
+        os.environ['DEB_CXXFLAGS_SET'] = ''
 
     prepend_env_value('PATH', os.path.join(prefix, 'bin'))
     prepend_env_value('PKG_CONFIG_PATH', os.path.join(prefix, 'lib', 'pkgconfig'))

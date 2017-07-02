@@ -243,7 +243,12 @@ save_obj_contents (const char *path, const void *data, int len, gboolean need_sy
     if (need_sync && fsync_obj_contents (fd) < 0)
         return -1;
 
-    close (fd);
+    /* Close may return error, especially in NFS. */
+    if (close (fd) < 0) {
+        seaf_warning ("[obj backend Failed close obj %s: %s.\n",
+                      tmp_path, strerror(errno));
+        return -1;
+    }
 
     if (need_sync) {
         if (rename_and_sync (tmp_path, path) < 0)
@@ -272,7 +277,8 @@ create_parent_path (const char *path)
     }
 
     if (g_mkdir_with_parents (dir, 0777) < 0) {
-        seaf_warning ("Failed to create object parent path: %s.\n", dir);
+        seaf_warning ("Failed to create object parent path %s: %s.\n",
+                      dir, strerror(errno));
         g_free (dir);
         return -1;
     }
@@ -299,12 +305,14 @@ obj_backend_fs_write (ObjBackend *bend,
     /* g_get_current_time (&s); */
 
     if (create_parent_path (path) < 0) {
-        seaf_warning ("[obj backend] Failed to create path for obj %s.\n", obj_id);
+        seaf_warning ("[obj backend] Failed to create path for obj %s:%s.\n",
+                      repo_id, obj_id);
         return -1;
     }
 
     if (save_obj_contents (path, data, len, need_sync) < 0) {
-        seaf_warning ("[obj backend] Failed to write obj %s.\n", obj_id);
+        seaf_warning ("[obj backend] Failed to write obj %s:%s.\n",
+                      repo_id, obj_id);
         return -1;
     }
 
@@ -384,7 +392,7 @@ obj_backend_fs_foreach_obj (ObjBackend *bend,
 
         dir2 = g_dir_open (path, 0, NULL);
         if (!dir2) {
-            g_warning ("Failed to open object dir %s.\n", path);
+            seaf_warning ("Failed to open object dir %s.\n", path);
             continue;
         }
 
@@ -431,7 +439,7 @@ obj_backend_fs_copy (ObjBackend *bend,
 
 #ifdef WIN32
     if (!CreateHardLink (dst_path, src_path, NULL)) {
-        seaf_warning ("Failed to link %s to %s: %d.\n",
+        seaf_warning ("Failed to link %s to %s: %lu.\n",
                       src_path, dst_path, GetLastError());
         return -1;
     }
@@ -445,6 +453,53 @@ obj_backend_fs_copy (ObjBackend *bend,
     }
     return ret;
 #endif
+}
+
+static int
+obj_backend_fs_remove_store (ObjBackend *bend, const char *store_id)
+{
+    FsPriv *priv = bend->priv;
+    char *obj_dir = NULL;
+    GDir *dir1, *dir2;
+    const char *dname1, *dname2;
+    char *path1, *path2;
+
+    obj_dir = g_build_filename (priv->obj_dir, store_id, NULL);
+
+    dir1 = g_dir_open (obj_dir, 0, NULL);
+    if (!dir1) {
+        g_free (obj_dir);
+        return 0;
+    }
+
+    while ((dname1 = g_dir_read_name(dir1)) != NULL) {
+        path1 = g_build_filename (obj_dir, dname1, NULL);
+
+        dir2 = g_dir_open (path1, 0, NULL);
+        if (!dir2) {
+            seaf_warning ("Failed to open obj dir %s.\n", path1);
+            g_dir_close (dir1);
+            g_free (path1);
+            g_free (obj_dir);
+            return -1;
+        }
+
+        while ((dname2 = g_dir_read_name(dir2)) != NULL) {
+            path2 = g_build_filename (path1, dname2, NULL);
+            g_unlink (path2);
+            g_free (path2);
+        }
+        g_dir_close (dir2);
+
+        g_rmdir (path1);
+        g_free (path1);
+    }
+
+    g_dir_close (dir1);
+    g_rmdir (obj_dir);
+    g_free (obj_dir);
+
+    return 0;
 }
 
 ObjBackend *
@@ -481,6 +536,7 @@ obj_backend_fs_new (const char *seaf_dir, const char *obj_type)
     bend->delete = obj_backend_fs_delete;
     bend->foreach_obj = obj_backend_fs_foreach_obj;
     bend->copy = obj_backend_fs_copy;
+    bend->remove_store = obj_backend_fs_remove_store;
 
     return bend;
 

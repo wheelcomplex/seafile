@@ -3,16 +3,26 @@
 #include <config.h>
 
 #include "common.h"
+
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x500
+#endif
+#endif
+
 #include "utils.h"
 
 #ifdef WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #include <Rpc.h>
-    #include <shlobj.h>
-    #include <psapi.h>
+
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <Rpc.h>
+#include <shlobj.h>
+#include <psapi.h>
+
 #else
-    #include <arpa/inet.h>
+#include <arpa/inet.h>
 #endif
 
 #ifndef WIN32
@@ -28,13 +38,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
-
 #include <string.h>
-#include <openssl/sha.h>
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
 
 #include <glib.h>
 #include <glib/gstdio.h>
@@ -199,7 +203,7 @@ objstore_get_path (char *path, const char *base, const char *obj_id)
  */
 #define UNIX_EPOCH 116444736000000000ULL
 
-inline static __time64_t
+__time64_t
 file_time_to_unix_time (FILETIME *ftime)
 {
     guint64 win_time, unix_time;
@@ -208,38 +212,6 @@ file_time_to_unix_time (FILETIME *ftime)
     unix_time = (win_time - UNIX_EPOCH)/10000000;
 
     return (__time64_t)unix_time;
-}
-
-static int
-get_utc_file_time (const char *path, const wchar_t *wpath,
-                   __time64_t *mtime, __time64_t *ctime)
-{
-    HANDLE handle;
-    FILETIME write_time, create_time;
-
-    handle = CreateFileW (wpath,
-                          GENERIC_READ,
-                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                          NULL,
-                          OPEN_EXISTING,
-                          FILE_FLAG_BACKUP_SEMANTICS,
-                          NULL);
-    if (handle == INVALID_HANDLE_VALUE) {
-        g_warning ("Failed to open %s: %lu.\n", path, GetLastError());
-        return -1;
-    }
-
-    if (!GetFileTime (handle, &create_time, NULL, &write_time)) {
-        g_warning ("Failed to get file time for %s: %lu.\n", path, GetLastError());
-        CloseHandle (handle);
-        return -1;
-    }
-    CloseHandle (handle);
-
-    *mtime = file_time_to_unix_time (&write_time);
-    *ctime = file_time_to_unix_time (&create_time);
-
-    return 0;
 }
 
 static int
@@ -307,22 +279,131 @@ set_utc_file_time (const char *path, const wchar_t *wpath, guint64 mtime)
     return 0;
 }
 
+wchar_t *
+win32_long_path (const char *path)
+{
+    char *long_path, *p;
+    wchar_t *long_path_w;
+
+    if (strncmp(path, "//", 2) == 0)
+        long_path = g_strconcat ("\\\\?\\UNC\\", path + 2, NULL);
+    else
+        long_path = g_strconcat ("\\\\?\\", path, NULL);
+    for (p = long_path; *p != 0; ++p)
+        if (*p == '/')
+            *p = '\\';
+
+    long_path_w = g_utf8_to_utf16 (long_path, -1, NULL, NULL, NULL);
+
+    g_free (long_path);
+    return long_path_w;
+}
+
+/* Convert a (possible) 8.3 format path to long path */
+wchar_t *
+win32_83_path_to_long_path (const char *worktree, const wchar_t *path, int path_len)
+{
+    wchar_t *worktree_w = g_utf8_to_utf16 (worktree, -1, NULL, NULL, NULL);
+    int wt_len;
+    wchar_t *p;
+    wchar_t *fullpath_w = NULL;
+    wchar_t *fullpath_long = NULL;
+    wchar_t *ret = NULL;
+    char *fullpath;
+
+    for (p = worktree_w; *p != L'\0'; ++p)
+        if (*p == L'/')
+            *p = L'\\';
+
+    wt_len = wcslen(worktree_w);
+
+    fullpath_w = g_new0 (wchar_t, wt_len + path_len + 6);
+    wcscpy (fullpath_w, L"\\\\?\\");
+    wcscat (fullpath_w, worktree_w);
+    wcscat (fullpath_w, L"\\");
+    wcsncat (fullpath_w, path, path_len);
+
+    fullpath_long = g_new0 (wchar_t, SEAF_PATH_MAX);
+
+    DWORD n = GetLongPathNameW (fullpath_w, fullpath_long, SEAF_PATH_MAX);
+    if (n == 0) {
+        /* Failed. */
+        fullpath = g_utf16_to_utf8 (fullpath_w, -1, NULL, NULL, NULL);
+        g_free (fullpath);
+
+        goto out;
+    } else if (n > SEAF_PATH_MAX) {
+        /* In this case n is the necessary length for the buf. */
+        g_free (fullpath_long);
+        fullpath_long = g_new0 (wchar_t, n);
+
+        if (GetLongPathNameW (fullpath_w, fullpath_long, n) != (n - 1)) {
+            fullpath = g_utf16_to_utf8 (fullpath_w, -1, NULL, NULL, NULL);
+            g_free (fullpath);
+
+            goto out;
+        }
+    }
+
+    /* Remove "\\?\worktree\" from the beginning. */
+    ret = wcsdup (fullpath_long + wt_len + 5);
+
+out:
+    g_free (worktree_w);
+    g_free (fullpath_w);
+    g_free (fullpath_long);
+
+    return ret;
+}
+
+static int
+windows_error_to_errno (DWORD error)
+{
+    switch (error) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+        return ENOENT;
+    case ERROR_ALREADY_EXISTS:
+        return EEXIST;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+        return EACCES;
+    case ERROR_DIR_NOT_EMPTY:
+        return ENOTEMPTY;
+    default:
+        return 0;
+    }
+}
+
 #endif
 
 int
 seaf_stat (const char *path, SeafStat *st)
 {
 #ifdef WIN32
-    wchar_t *wpath = g_utf8_to_utf16 (path, -1, NULL, NULL, NULL);
+    wchar_t *wpath = win32_long_path (path);
+    WIN32_FILE_ATTRIBUTE_DATA attrs;
     int ret = 0;
 
-    if (_wstat64 (wpath, st) < 0) {
+    if (!GetFileAttributesExW (wpath, GetFileExInfoStandard, &attrs)) {
         ret = -1;
+        errno = windows_error_to_errno (GetLastError());
         goto out;
     }
 
-    if (get_utc_file_time (path, wpath, &st->st_mtime, &st->st_ctime) < 0)
-        ret = -1;
+    memset (st, 0, sizeof(SeafStat));
+
+    if (attrs.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        st->st_mode = (S_IFDIR | S_IRWXU);
+    else
+        st->st_mode = (S_IFREG | S_IRUSR | S_IWUSR);
+
+    st->st_atime = file_time_to_unix_time (&attrs.ftLastAccessTime);
+    st->st_ctime = file_time_to_unix_time (&attrs.ftCreationTime);
+    st->st_mtime = file_time_to_unix_time (&attrs.ftLastWriteTime);
+
+    st->st_size = ((((__int64)attrs.nFileSizeHigh)<<32) + attrs.nFileSizeLow);
+
 out:
     g_free (wpath);
 
@@ -348,6 +429,27 @@ seaf_fstat (int fd, SeafStat *st)
 #endif
 }
 
+#ifdef WIN32
+
+void
+seaf_stat_from_find_data (WIN32_FIND_DATAW *fdata, SeafStat *st)
+{
+    memset (st, 0, sizeof(SeafStat));
+
+    if (fdata->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        st->st_mode = (S_IFDIR | S_IRWXU);
+    else
+        st->st_mode = (S_IFREG | S_IRUSR | S_IWUSR);
+
+    st->st_atime = file_time_to_unix_time (&fdata->ftLastAccessTime);
+    st->st_ctime = file_time_to_unix_time (&fdata->ftCreationTime);
+    st->st_mtime = file_time_to_unix_time (&fdata->ftLastWriteTime);
+
+    st->st_size = ((((__int64)fdata->nFileSizeHigh)<<32) + fdata->nFileSizeLow);
+}
+
+#endif
+
 int
 seaf_set_file_time (const char *path, guint64 mtime)
 {
@@ -365,7 +467,7 @@ seaf_set_file_time (const char *path, guint64 mtime)
 
     return utime (path, &times);
 #else
-    wchar_t *wpath = g_utf8_to_utf16 (path, -1, NULL, NULL, NULL);
+    wchar_t *wpath = win32_long_path (path);
     int ret = 0;
 
     if (set_utc_file_time (path, wpath, mtime) < 0)
@@ -375,6 +477,254 @@ seaf_set_file_time (const char *path, guint64 mtime)
     return ret;
 #endif
 }
+
+int
+seaf_util_unlink (const char *path)
+{
+#ifdef WIN32
+    wchar_t *wpath = win32_long_path (path);
+    int ret = 0;
+
+    if (!DeleteFileW (wpath)) {
+        ret = -1;
+        errno = windows_error_to_errno (GetLastError());
+    }
+
+    g_free (wpath);
+    return ret;
+#else
+    return unlink (path);
+#endif
+}
+
+int
+seaf_util_rmdir (const char *path)
+{
+#ifdef WIN32
+    wchar_t *wpath = win32_long_path (path);
+    int ret = 0;
+
+    if (!RemoveDirectoryW (wpath)) {
+        ret = -1;
+        errno = windows_error_to_errno (GetLastError());
+    }
+
+    g_free (wpath);
+    return ret;
+#else
+    return rmdir (path);
+#endif
+}
+
+int
+seaf_util_mkdir (const char *path, mode_t mode)
+{
+#ifdef WIN32
+    wchar_t *wpath = win32_long_path (path);
+    int ret = 0;
+
+    if (!CreateDirectoryW (wpath, NULL)) {
+        ret = -1;
+        errno = windows_error_to_errno (GetLastError());
+    }
+
+    g_free (wpath);
+    return ret;
+#else
+    return mkdir (path, mode);
+#endif
+}
+
+int
+seaf_util_open (const char *path, int flags)
+{
+#ifdef WIN32
+    wchar_t *wpath;
+    DWORD access = 0;
+    HANDLE handle;
+    int fd;
+
+    access |= GENERIC_READ;
+    if (flags & (O_WRONLY | O_RDWR))
+        access |= GENERIC_WRITE;
+
+    wpath = win32_long_path (path);
+
+    handle = CreateFileW (wpath,
+                          access,
+                          FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          NULL,
+                          OPEN_EXISTING,
+                          0,
+                          NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = windows_error_to_errno (GetLastError());
+        g_free (wpath);
+        return -1;
+    }
+
+    fd = _open_osfhandle ((intptr_t)handle, 0);
+
+    g_free (wpath);
+    return fd;
+#else
+    return open (path, flags);
+#endif
+}
+
+int
+seaf_util_create (const char *path, int flags, mode_t mode)
+{
+#ifdef WIN32
+    wchar_t *wpath;
+    DWORD access = 0;
+    HANDLE handle;
+    int fd;
+
+    access |= GENERIC_READ;
+    if (flags & (O_WRONLY | O_RDWR))
+        access |= GENERIC_WRITE;
+
+    wpath = win32_long_path (path);
+
+    handle = CreateFileW (wpath,
+                          access,
+                          FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          NULL,
+                          CREATE_ALWAYS,
+                          0,
+                          NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = windows_error_to_errno (GetLastError());
+        g_free (wpath);
+        return -1;
+    }
+
+    fd = _open_osfhandle ((intptr_t)handle, 0);
+
+    g_free (wpath);
+    return fd;
+#else
+    return open (path, flags, mode);
+#endif
+}
+
+int
+seaf_util_rename (const char *oldpath, const char *newpath)
+{
+#ifdef WIN32
+    wchar_t *oldpathw = win32_long_path (oldpath);
+    wchar_t *newpathw = win32_long_path (newpath);
+    int ret = 0;
+
+    if (!MoveFileExW (oldpathw, newpathw, MOVEFILE_REPLACE_EXISTING)) {
+        ret = -1;
+        errno = windows_error_to_errno (GetLastError());
+    }
+
+    g_free (oldpathw);
+    g_free (newpathw);
+    return ret;
+#else
+    return rename (oldpath, newpath);
+#endif
+}
+
+gboolean
+seaf_util_exists (const char *path)
+{
+#ifdef WIN32
+    wchar_t *wpath = win32_long_path (path);
+    DWORD attrs;
+    gboolean ret;
+
+    attrs = GetFileAttributesW (wpath);
+    ret = (attrs != INVALID_FILE_ATTRIBUTES);
+
+    g_free (wpath);
+    return ret;
+#else
+    return (access (path, F_OK) == 0);
+#endif
+}
+
+gint64
+seaf_util_lseek (int fd, gint64 offset, int whence)
+{
+#ifdef WIN32
+    return _lseeki64 (fd, offset, whence);
+#else
+    return lseek (fd, offset, whence);
+#endif
+}
+
+#ifdef WIN32
+
+int
+traverse_directory_win32 (wchar_t *path_w,
+                          DirentCallback callback,
+                          void *user_data)
+{
+    WIN32_FIND_DATAW fdata;
+    HANDLE handle;
+    wchar_t *pattern;
+    char *path;
+    int path_len_w;
+    DWORD error;
+    gboolean stop;
+    int ret = 0;
+
+    path = g_utf16_to_utf8 (path_w, -1, NULL, NULL, NULL);
+
+    path_len_w = wcslen(path_w);
+
+    pattern = g_new0 (wchar_t, (path_len_w + 3));
+    wcscpy (pattern, path_w);
+    wcscat (pattern, L"\\*");
+
+    handle = FindFirstFileW (pattern, &fdata);
+    if (handle == INVALID_HANDLE_VALUE) {
+        g_warning ("FindFirstFile failed %s: %lu.\n",
+                   path, GetLastError());
+        ret = -1;
+        goto out;
+    }
+
+    do {
+        if (wcscmp (fdata.cFileName, L".") == 0 ||
+            wcscmp (fdata.cFileName, L"..") == 0)
+            continue;
+
+        ++ret;
+
+        stop = FALSE;
+        if (callback (path_w, &fdata, user_data, &stop) < 0) {
+            ret = -1;
+            FindClose (handle);
+            goto out;
+        }
+        if (stop) {
+            FindClose (handle);
+            goto out;
+        }
+    } while (FindNextFileW (handle, &fdata) != 0);
+
+    error = GetLastError();
+    if (error != ERROR_NO_MORE_FILES) {
+        g_warning ("FindNextFile failed %s: %lu.\n",
+                   path, error);
+        ret = -1;
+    }
+
+    FindClose (handle);
+
+out:
+    g_free (path);
+    g_free (pattern);
+    return ret;
+}
+
+#endif
 
 ssize_t						/* Read "n" bytes from a descriptor. */
 readn(int fd, void *vptr, size_t n)
@@ -425,7 +775,7 @@ writen(int fd, const void *vptr, size_t n)
 
 
 ssize_t						/* Read "n" bytes from a descriptor. */
-recvn(int fd, void *vptr, size_t n)
+recvn(evutil_socket_t fd, void *vptr, size_t n)
 {
 	size_t	nleft;
 	ssize_t	nread;
@@ -454,7 +804,7 @@ recvn(int fd, void *vptr, size_t n)
 }
 
 ssize_t						/* Write "n" bytes to a descriptor. */
-sendn(int fd, const void *vptr, size_t n)
+sendn(evutil_socket_t fd, const void *vptr, size_t n)
 {
 	size_t		nleft;
 	ssize_t		nwritten;
@@ -638,14 +988,16 @@ ccnet_expand_path (const char *src)
 int
 calculate_sha1 (unsigned char *sha1, const char *msg, int len)
 {
-    SHA_CTX c;
+    GChecksum *c;
+    gsize cs_len = 20;
 
     if (len < 0)
         len = strlen(msg);
 
-    SHA1_Init(&c);
-    SHA1_Update(&c, msg, len);    
-	SHA1_Final(sha1, &c);
+    c = g_checksum_new (G_CHECKSUM_SHA1);
+    g_checksum_update(c, (const unsigned char *)msg, len);    
+    g_checksum_get_digest (c, sha1, &cs_len);
+    g_checksum_free (c);
     return 0;
 }
 
@@ -703,6 +1055,9 @@ is_uuid_valid (const char *uuid_str)
 {
     uuid_t uuid;
 
+    if (!uuid_str)
+        return FALSE;
+
     if (uuid_parse (uuid_str, uuid) < 0)
         return FALSE;
     return TRUE;
@@ -736,6 +1091,9 @@ void gen_uuid_inplace (char *buf)
 gboolean
 is_uuid_valid (const char *uuid_str)
 {
+    if (!uuid_str)
+        return FALSE;
+
     UUID uuid;
     if (UuidFromString((unsigned char *)uuid_str, &uuid) != RPC_S_OK)
         return FALSE;
@@ -743,6 +1101,29 @@ is_uuid_valid (const char *uuid_str)
 }
 
 #endif
+
+gboolean
+is_object_id_valid (const char *obj_id)
+{
+    if (!obj_id)
+        return FALSE;
+
+    int len = strlen(obj_id);
+    int i;
+    char c;
+
+    if (len != 40)
+        return FALSE;
+
+    for (i = 0; i < len; ++i) {
+        c = obj_id[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))
+            continue;
+        return FALSE;
+    }
+
+    return TRUE;
+}
 
 char** strsplit_by_space (char *string, int *length)
 {
@@ -1135,309 +1516,88 @@ get_current_time()
 }
 
 #ifdef WIN32
+static SOCKET pg_serv_sock = INVALID_SOCKET;
+static struct sockaddr_in pg_serv_addr;
+
+/* pgpipe() should only be called in the main loop,
+ * since it accesses the static global socket.
+ */
 int
 pgpipe (ccnet_pipe_t handles[2])
 {
-    SOCKET s;
-    struct sockaddr_in serv_addr;
-    int len = sizeof( serv_addr );
+    int len = sizeof( pg_serv_addr );
 
     handles[0] = handles[1] = INVALID_SOCKET;
 
-    if ( ( s = socket( AF_INET, SOCK_STREAM, 0 ) ) == INVALID_SOCKET )
-    {
-        g_warning("pgpipe failed to create socket: %d\n", WSAGetLastError());
-        return -1;
+    if (pg_serv_sock == INVALID_SOCKET) {
+        if ((pg_serv_sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
+            g_warning("pgpipe failed to create socket: %d\n", WSAGetLastError());
+            return -1;
+        }
+
+        memset(&pg_serv_addr, 0, sizeof(pg_serv_addr));
+        pg_serv_addr.sin_family = AF_INET;
+        pg_serv_addr.sin_port = htons(0);
+        pg_serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+        if (bind(pg_serv_sock, (SOCKADDR *)&pg_serv_addr, len) == SOCKET_ERROR) {
+            g_warning("pgpipe failed to bind: %d\n", WSAGetLastError());
+            closesocket(pg_serv_sock);
+            pg_serv_sock = INVALID_SOCKET;
+            return -1;
+        }
+
+        if (listen(pg_serv_sock, SOMAXCONN) == SOCKET_ERROR) {
+            g_warning("pgpipe failed to listen: %d\n", WSAGetLastError());
+            closesocket(pg_serv_sock);
+            pg_serv_sock = INVALID_SOCKET;
+            return -1;
+        }
+
+        struct sockaddr_in tmp_addr;
+        int tmp_len = sizeof(tmp_addr);
+        if (getsockname(pg_serv_sock, (SOCKADDR *)&tmp_addr, &tmp_len) == SOCKET_ERROR) {
+            g_warning("pgpipe failed to getsockname: %d\n", WSAGetLastError());
+            closesocket(pg_serv_sock);
+            pg_serv_sock = INVALID_SOCKET;
+            return -1;
+        }
+        pg_serv_addr.sin_port = tmp_addr.sin_port;
     }
 
-    memset( &serv_addr, 0, sizeof( serv_addr ) );
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(0);
-    serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(s, (SOCKADDR *) & serv_addr, len) == SOCKET_ERROR)
-    {
-        g_warning("pgpipe failed to bind: %d\n", WSAGetLastError());
-        closesocket(s);
-        return -1;
-    }
-    if (listen(s, 1) == SOCKET_ERROR)
-    {
-        g_warning("pgpipe failed to listen: %d\n", WSAGetLastError());
-        closesocket(s);
-        return -1;
-    }
-    if (getsockname(s, (SOCKADDR *) & serv_addr, &len) == SOCKET_ERROR)
-    {
-        g_warning("pgpipe failed to getsockname: %d\n", WSAGetLastError());
-        closesocket(s);
-        return -1;
-    }
     if ((handles[1] = socket(PF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
     {
         g_warning("pgpipe failed to create socket 2: %d\n", WSAGetLastError());
-        closesocket(s);
+        closesocket(pg_serv_sock);
+        pg_serv_sock = INVALID_SOCKET;
         return -1;
     }
 
-    if (connect(handles[1], (SOCKADDR *) & serv_addr, len) == SOCKET_ERROR)
+    if (connect(handles[1], (SOCKADDR *)&pg_serv_addr, len) == SOCKET_ERROR)
     {
         g_warning("pgpipe failed to connect socket: %d\n", WSAGetLastError());
-        closesocket(s);
+        closesocket(handles[1]);
+        handles[1] = INVALID_SOCKET;
+        closesocket(pg_serv_sock);
+        pg_serv_sock = INVALID_SOCKET;
         return -1;
     }
-    if ((handles[0] = accept(s, (SOCKADDR *) & serv_addr, &len)) == INVALID_SOCKET)
+
+    struct sockaddr_in client_addr;
+    int client_len = sizeof(client_addr);
+    if ((handles[0] = accept(pg_serv_sock, (SOCKADDR *)&client_addr, &client_len)) == INVALID_SOCKET)
     {
         g_warning("pgpipe failed to accept socket: %d\n", WSAGetLastError());
         closesocket(handles[1]);
         handles[1] = INVALID_SOCKET;
-        closesocket(s);
+        closesocket(pg_serv_sock);
+        pg_serv_sock = INVALID_SOCKET;
         return -1;
     }
-    closesocket(s);
+
     return 0;
 }
 #endif
-
-/*
-  The EVP_EncryptXXX and EVP_DecryptXXX series of functions have a
-  weird choice of returned value.
-*/
-#define ENC_SUCCESS 1
-#define ENC_FAILURE 0
-#define DEC_SUCCESS 1
-#define DEC_FAILURE 0
-
-
-#include <openssl/aes.h>
-#include <openssl/evp.h>
-
-/* Block size, in bytes. For AES it can only be 16 bytes. */
-#define BLK_SIZE 16
-#define ENCRYPT_BLK_SIZE BLK_SIZE
-
-
-int
-ccnet_encrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len)
-{
-    *data_out = NULL;
-    *out_len = -1;
-
-    /* check validation */
-    if ( data_in == NULL || in_len <= 0 ||
-         code == NULL || code_len <= 0) {
-
-        g_warning ("Invalid params.\n");
-        return -1;
-    }
-
-    EVP_CIPHER_CTX ctx;
-    int ret, key_len;
-    unsigned char key[16], iv[16];
-    int blks;                   
-
-    
-    /* Generate the derived key. We use AES 128 bits key,
-       Electroic-Code-Book cipher mode, and SHA1 as the message digest
-       when generating the key. IV is not used in ecb mode,
-       actually. */
-    key_len  = EVP_BytesToKey (EVP_aes_128_ecb(), /* cipher mode */
-                               EVP_sha1(),        /* message digest */
-                               NULL,              /* salt */
-                               (unsigned char*)code, /* passwd */
-                               code_len,
-                               3,   /* iteration times */
-                               key, /* the derived key */
-                               iv); /* IV, initial vector */
-
-    /* The key should be 16 bytes long for our 128 bit key. */
-    if (key_len != 16) {
-        g_warning ("failed to init EVP_CIPHER_CTX.\n");
-        return -1;
-    }
-
-    /* Prepare CTX for encryption. */
-    EVP_CIPHER_CTX_init (&ctx);
-
-    ret = EVP_EncryptInit_ex (&ctx,
-                              EVP_aes_128_ecb(), /* cipher mode */
-                              NULL, /* engine, NULL for default */
-                              key,  /* derived key */
-                              iv);  /* initial vector */
-
-    if (ret == ENC_FAILURE)
-        return -1;
-
-    /* Allocating output buffer. */
-    
-    /*
-      For EVP symmetric encryption, padding is always used __even if__
-      data size is a multiple of block size, in which case the padding
-      length is the block size. so we have the following:
-    */
-    
-    blks = (in_len / BLK_SIZE) + 1;
-
-    *data_out = (char *)g_malloc (blks * BLK_SIZE);
-
-    if (*data_out == NULL) {
-        g_warning ("failed to allocate the output buffer.\n");
-        goto enc_error;
-    }                
-
-    int update_len, final_len;
-
-    /* Do the encryption. */
-    ret = EVP_EncryptUpdate (&ctx,
-                             (unsigned char*)*data_out,
-                             &update_len,
-                             (unsigned char*)data_in,
-                             in_len);
-
-    if (ret == ENC_FAILURE)
-        goto enc_error;
-
-
-    /* Finish the possible partial block. */
-    ret = EVP_EncryptFinal_ex (&ctx,
-                               (unsigned char*)*data_out + update_len,
-                               &final_len);
-
-    *out_len = update_len + final_len;
-
-    /* out_len should be equal to the allocated buffer size. */
-    if (ret == ENC_FAILURE || *out_len != (blks * BLK_SIZE))
-        goto enc_error;
-    
-    EVP_CIPHER_CTX_cleanup (&ctx);
-
-    return 0;
-
-enc_error:
-
-    EVP_CIPHER_CTX_cleanup (&ctx);
-
-    *out_len = -1;
-
-    if (*data_out != NULL)
-        g_free (*data_out);
-
-    *data_out = NULL;
-
-    return -1;   
-}
-
-int
-ccnet_decrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len)
-{
-    *data_out = NULL;
-    *out_len = -1;
-
-    /* Check validation. Because padding is always used, in_len must
-     * be a multiple of BLK_SIZE */
-    if ( data_in == NULL || in_len <= 0 || in_len % BLK_SIZE != 0 ||
-         code == NULL || code_len <= 0) {
-
-        g_warning ("Invalid param(s).\n");
-        return -1;
-    }
-
-    EVP_CIPHER_CTX ctx;
-    int ret, key_len;
-    unsigned char key[16], iv[16];
-
-   
-    /* Generate the derived key. We use AES 128 bits key,
-       Electroic-Code-Book cipher mode, and SHA1 as the message digest
-       when generating the key. IV is not used in ecb mode,
-       actually. */
-    key_len  = EVP_BytesToKey (EVP_aes_128_ecb(), /* cipher mode */
-                               EVP_sha1(),        /* message digest */
-                               NULL,              /* salt */
-                               (unsigned char*)code, /* passwd */
-                               code_len,
-                               3,   /* iteration times */
-                               key, /* the derived key */
-                               iv); /* IV, initial vector */
-
-    /* The key should be 16 bytes long for our 128 bit key. */
-    if (key_len != 16) {
-        g_warning ("failed to init EVP_CIPHER_CTX.\n");
-        return -1;
-    }
-
-
-    /* Prepare CTX for decryption. */
-    EVP_CIPHER_CTX_init (&ctx);
-
-    ret = EVP_DecryptInit_ex (&ctx,
-                              EVP_aes_128_ecb(), /* cipher mode */
-                              NULL, /* engine, NULL for default */
-                              key,  /* derived key */
-                              iv);  /* initial vector */
-
-    if (ret == DEC_FAILURE)
-        return -1;
-
-    /* Allocating output buffer. */
-    
-    *data_out = (char *)g_malloc (in_len);
-
-    if (*data_out == NULL) {
-        g_warning ("failed to allocate the output buffer.\n");
-        goto dec_error;
-    }                
-
-    int update_len, final_len;
-
-    /* Do the decryption. */
-    ret = EVP_DecryptUpdate (&ctx,
-                             (unsigned char*)*data_out,
-                             &update_len,
-                             (unsigned char*)data_in,
-                             in_len);
-
-    if (ret == DEC_FAILURE)
-        goto dec_error;
-
-
-    /* Finish the possible partial block. */
-    ret = EVP_DecryptFinal_ex (&ctx,
-                               (unsigned char*)*data_out + update_len,
-                               &final_len);
-
-    *out_len = update_len + final_len;
-
-    /* out_len should be smaller than in_len. */
-    if (ret == DEC_FAILURE || *out_len > in_len)
-        goto dec_error;
-
-    EVP_CIPHER_CTX_cleanup (&ctx);
-    
-    return 0;
-
-dec_error:
-
-    EVP_CIPHER_CTX_cleanup (&ctx);
-
-    *out_len = -1;
-    if (*data_out != NULL)
-        g_free (*data_out);
-
-    *data_out = NULL;
-
-    return -1;
-    
-}
 
 /* convert locale specific input to utf8 encoded string  */
 char *ccnet_locale_to_utf8 (const gchar *src)
@@ -2026,6 +2186,14 @@ clean_utf8_data (char *data, int len)
     }
 }
 
+char *
+normalize_utf8_path (const char *path)
+{
+    if (!g_utf8_validate (path, -1, NULL))
+        return NULL;
+    return g_utf8_normalize (path, -1, G_NORMALIZE_NFC);
+}
+
 /* zlib related wrapper functions. */
 
 #define ZLIB_BUF_SIZE 16384
@@ -2038,6 +2206,9 @@ seaf_compress (guint8 *input, int inlen, guint8 **output, int *outlen)
     z_stream strm;
     guint8 out[ZLIB_BUF_SIZE];
     GByteArray *barray;
+
+    if (inlen == 0)
+        return -1;
 
     /* allocate deflate state */
     strm.zalloc = Z_NULL;
@@ -2078,6 +2249,11 @@ seaf_decompress (guint8 *input, int inlen, guint8 **output, int *outlen)
     unsigned char out[ZLIB_BUF_SIZE];
     GByteArray *barray;
 
+    if (inlen == 0) {
+        g_warning ("Empty input for zlib, invalid.\n");
+        return -1;
+    }
+
     /* allocate inflate state */
     strm.zalloc = Z_NULL;
     strm.zfree = Z_NULL;
@@ -2097,12 +2273,8 @@ seaf_decompress (guint8 *input, int inlen, guint8 **output, int *outlen)
     do {
         strm.avail_out = ZLIB_BUF_SIZE;
         strm.next_out = out;
-        ret = inflate(&strm, Z_FINISH);
-        switch (ret) {
-        case Z_NEED_DICT:
-            ret = Z_DATA_ERROR;     /* and fall through */
-        case Z_DATA_ERROR:
-        case Z_MEM_ERROR:
+        ret = inflate(&strm, Z_NO_FLUSH);
+        if (ret < 0) {
             g_warning ("Failed to inflate.\n");
             goto out;
         }
@@ -2122,4 +2294,39 @@ out:
         g_byte_array_free (barray, TRUE);
         return -1;
     }
+}
+
+char*
+format_dir_path (const char *path)
+{
+    int path_len = strlen (path);
+    char *rpath;
+    if (path[0] != '/') {
+        rpath = g_strconcat ("/", path, NULL);
+        path_len++;
+    } else {
+        rpath = g_strdup (path);
+    }
+    while (path_len > 1 && rpath[path_len-1] == '/') {
+        rpath[path_len-1] = '\0';
+        path_len--;
+    }
+
+    return rpath;
+}
+
+gboolean
+is_empty_string (const char *str)
+{
+    return !str || strcmp (str, "") == 0;
+}
+
+gboolean
+is_permission_valid (const char *perm)
+{
+    if (is_empty_string (perm)) {
+        return FALSE;
+    }
+
+    return strcmp (perm, "r") == 0 || strcmp (perm, "rw") == 0;
 }

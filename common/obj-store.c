@@ -1,7 +1,11 @@
 #include "common.h"
 
+#include "log.h"
+
 #include <ccnet/cevent.h>
 #include "seafile-session.h"
+
+#include "utils.h"
 
 #include "obj-backend.h"
 #include "obj-store.h"
@@ -78,7 +82,7 @@ seaf_obj_store_new (SeafileSession *seaf, const char *obj_type)
 
     store->bend = obj_backend_fs_new (seaf->seaf_dir, obj_type);
     if (!store->bend) {
-        g_warning ("[Object store] Failed to load backend.\n");
+        seaf_warning ("[Object store] Failed to load backend.\n");
         g_free (store);
         return NULL;
     }
@@ -99,7 +103,7 @@ async_init (SeafObjStore *obj_store, CEventManager *ev_mgr)
                                                FALSE,
                                                &error);
     if (error) {
-        g_warning ("Failed to start reader thread pool: %s.\n", error->message);
+        seaf_warning ("Failed to start reader thread pool: %s.\n", error->message);
         g_clear_error (&error);
         return -1;
     }
@@ -116,7 +120,7 @@ async_init (SeafObjStore *obj_store, CEventManager *ev_mgr)
                                                 FALSE,
                                                 &error);
     if (error) {
-        g_warning ("Failed to start writer thread pool: %s.\n", error->message);
+        seaf_warning ("Failed to start writer thread pool: %s.\n", error->message);
         g_clear_error (&error);
         return -1;
     }
@@ -133,7 +137,7 @@ async_init (SeafObjStore *obj_store, CEventManager *ev_mgr)
                                                FALSE,
                                                &error);
     if (error) {
-        g_warning ("Failed to start statr thread pool: %s.\n", error->message);
+        seaf_warning ("Failed to start statr thread pool: %s.\n", error->message);
         g_clear_error (&error);
         return -1;
     }
@@ -168,6 +172,10 @@ seaf_obj_store_read_obj (struct SeafObjStore *obj_store,
 {
     ObjBackend *bend = obj_store->bend;
 
+    if (!repo_id || !is_uuid_valid(repo_id) ||
+        !obj_id || !is_object_id_valid(obj_id))
+        return -1;
+
     return bend->read (bend, repo_id, version, obj_id, data, len);
 }
 
@@ -182,6 +190,10 @@ seaf_obj_store_write_obj (struct SeafObjStore *obj_store,
 {
     ObjBackend *bend = obj_store->bend;
 
+    if (!repo_id || !is_uuid_valid(repo_id) ||
+        !obj_id || !is_object_id_valid(obj_id))
+        return -1;
+
     return bend->write (bend, repo_id, version, obj_id, data, len, need_sync);
 }
 
@@ -193,6 +205,10 @@ seaf_obj_store_obj_exists (struct SeafObjStore *obj_store,
 {
     ObjBackend *bend = obj_store->bend;
 
+    if (!repo_id || !is_uuid_valid(repo_id) ||
+        !obj_id || !is_object_id_valid(obj_id))
+        return FALSE;
+
     return bend->exists (bend, repo_id, version, obj_id);
 }
 
@@ -203,6 +219,10 @@ seaf_obj_store_delete_obj (struct SeafObjStore *obj_store,
                            const char *obj_id)
 {
     ObjBackend *bend = obj_store->bend;
+
+    if (!repo_id || !is_uuid_valid(repo_id) ||
+        !obj_id || !is_object_id_valid(obj_id))
+        return;
 
     return bend->delete (bend, repo_id, version, obj_id);
 }
@@ -412,7 +432,7 @@ seaf_obj_store_async_read (struct SeafObjStore *obj_store,
 
     g_thread_pool_push (obj_store->read_tpool, task, &error);
     if (error) {
-        g_warning ("Failed to start aysnc read of %s.\n", obj_id);
+        seaf_warning ("Failed to start aysnc read of %s.\n", obj_id);
         return -1;
     }
 
@@ -459,7 +479,7 @@ seaf_obj_store_async_stat (struct SeafObjStore *obj_store,
 
     g_thread_pool_push (obj_store->stat_tpool, task, &error);
     if (error) {
-        g_warning ("Failed to start aysnc stat of %s.\n", obj_id);
+        seaf_warning ("Failed to start aysnc stat of %s.\n", obj_id);
         return -1;
     }
 
@@ -512,9 +532,18 @@ seaf_obj_store_async_write (struct SeafObjStore *obj_store,
 
     g_thread_pool_push (obj_store->write_tpool, task, &error);
     if (error) {
-        g_warning ("Failed to start aysnc write of %s.\n", obj_id);
+        seaf_warning ("Failed to start aysnc write of %s.\n", obj_id);
         return -1;
     }
 
     return 0;
+}
+
+int
+seaf_obj_store_remove_store (struct SeafObjStore *obj_store,
+                             const char *store_id)
+{
+    ObjBackend *bend = obj_store->bend;
+
+    return bend->remove_store (bend, store_id);
 }

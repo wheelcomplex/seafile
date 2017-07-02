@@ -13,6 +13,8 @@
 #include "common.h"
 #include "utils.h"
 
+#include "log.h"
+
 #include "index.h"
 #include "../seafile-crypt.h"
 /* #include "../vc-utils.h" */
@@ -20,7 +22,6 @@
 
 #include <glib.h>
 #include <glib/gstdio.h>
-#include <openssl/sha.h>
 
 #ifdef WIN32
 
@@ -35,16 +36,16 @@ void *git_mmap(void *start, size_t length, int prot, int flags, int fd, off_t of
     hmap = CreateFileMapping((HANDLE)_get_osfhandle(fd), 0, PAGE_WRITECOPY,
                              0, 0, 0);
     if (!hmap) {
-        g_warning ("CreateFileMapping error: %lu.\n", GetLastError());
+        seaf_warning ("CreateFileMapping error: %lu.\n", GetLastError());
         return MAP_FAILED;
     }
 
     temp = MapViewOfFileEx(hmap, FILE_MAP_COPY, h, l, length, start);
     if (!temp)
-        g_warning ("MapViewOfFileEx error: %lu.\n", GetLastError());
+        seaf_warning ("MapViewOfFileEx error: %lu.\n", GetLastError());
 
     if (!CloseHandle(hmap))
-        g_warning ("unable to close file mapping handle\n");
+        seaf_warning ("unable to close file mapping handle\n");
 
     return temp ? temp : MAP_FAILED;
 }
@@ -73,8 +74,9 @@ static void replace_index_entry(struct index_state *istate, int nr, struct cache
 
 static int verify_hdr(struct cache_header *hdr, unsigned long size)
 {
-    SHA_CTX c;
+    GChecksum *c;
     unsigned char sha1[20];
+    gsize len = 20;
 
     if (hdr->hdr_signature != htonl(CACHE_SIGNATURE)) {
         g_critical("bad signature\n");
@@ -85,28 +87,15 @@ static int verify_hdr(struct cache_header *hdr, unsigned long size)
         g_critical("bad index version\n");
         return -1;
     }
-    SHA1_Init(&c);
-    SHA1_Update(&c, hdr, size - 20);
-    SHA1_Final(sha1, &c);
+    c = g_checksum_new (G_CHECKSUM_SHA1);
+    g_checksum_update(c, (unsigned char *)hdr, size - 20);
+    g_checksum_get_digest (c, sha1, &len);
+    g_checksum_free (c);
     if (hashcmp(sha1, (unsigned char *)hdr + size - 20)) {
         g_critical("bad index file sha1 signature\n");
         return -1;
     }
     return 0;
-}
-
-static inline size_t estimate_cache_size(size_t ondisk_size, unsigned int entries)
-{
-    long per_entry;
-
-    per_entry = sizeof(struct cache_entry) - sizeof(struct ondisk_cache_entry);
-
-    /*
-     * Alignment can cause differences. This should be "alignof", but
-     * since that's a gcc'ism, just use the size of a pointer.
-     */
-    per_entry += sizeof(void *);
-    return ondisk_size + entries*per_entry;
 }
 
 static int convert_from_disk(struct ondisk_cache_entry *ondisk, struct cache_entry **ce)
@@ -219,7 +208,7 @@ static int read_modifiers (struct index_state *istate, void *data, unsigned int 
                    S_ISDIR(istate->cache[idx]->ce_mode))
                 ++idx;
             if (idx >= istate->cache_nr) {
-                g_warning ("More modifiers than cache entries.\n");
+                seaf_warning ("More modifiers than cache entries.\n");
                 return -1;
             }
 
@@ -236,7 +225,7 @@ static int read_modifiers (struct index_state *istate, void *data, unsigned int 
         ++idx;
 
     if (idx != istate->cache_nr) {
-        g_warning ("Less modifiers than cached entries.\n");
+        seaf_warning ("Less modifiers than cached entries.\n");
         return -1;
     }
 
@@ -256,6 +245,20 @@ static int read_index_extension(struct index_state *istate,
         break;
     }
     return 0;
+}
+
+static void alloc_index (struct index_state *istate)
+{
+    istate->cache_alloc = alloc_nr(istate->cache_nr);
+    istate->cache = calloc(istate->cache_alloc, sizeof(struct cache_entry *));
+    istate->name_hash = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                               g_free, NULL);
+#if defined WIN32 || defined __APPLE__
+    istate->i_name_hash = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                                 g_free, NULL);
+#endif
+    istate->initialized = 1;
+    istate->name_hash_initialized = 1;
 }
 
 /* remember to discard_cache() before reading a different cache! */
@@ -278,22 +281,26 @@ int read_index_from(struct index_state *istate, const char *path, int repo_versi
         istate->has_modifier = 1;
     istate->timestamp.sec = 0;
     istate->timestamp.nsec = 0;
-    fd = g_open (path, O_RDONLY | O_BINARY, 0);
+    fd = seaf_util_open (path, O_RDONLY | O_BINARY);
     if (fd < 0) {
-        if (errno == ENOENT)
+        if (errno == ENOENT) {
+            alloc_index (istate);
             return 0;
+        }
         g_critical("index file open failed\n");
         return -1;
     }
 
     if (seaf_fstat(fd, &st)) {
         g_critical("cannot stat the open index\n");
+        close(fd);
         return -1;
     }
 
     mmap_size = (size_t)st.st_size;
     if (mmap_size < sizeof(struct cache_header) + 20) {
         g_critical("index file smaller than expected\n");
+        close(fd);
         return -1;
     }
 
@@ -314,14 +321,7 @@ int read_index_from(struct index_state *istate, const char *path, int repo_versi
      */
     istate->version = ntohl(hdr->hdr_version);
     istate->cache_nr = ntohl(hdr->hdr_entries);
-    istate->cache_alloc = alloc_nr(istate->cache_nr);
-    istate->cache = calloc(istate->cache_alloc, sizeof(struct cache_entry *));
-    istate->name_hash = g_hash_table_new_full (g_str_hash, g_str_equal,
-                                               g_free, NULL);
-#if defined WIN32 || defined __APPLE__
-    istate->i_name_hash = g_hash_table_new_full (g_str_hash, g_str_equal,
-                                                 g_free, NULL);
-#endif
+    alloc_index (istate);
 
     /*
      * The disk format is actually larger than the in-memory format,
@@ -329,8 +329,6 @@ int read_index_from(struct index_state *istate, const char *path, int repo_versi
      * has room for a few  more flags, we can allocate using the same
      * index size
      */
-    /* istate->alloc = malloc(estimate_cache_size(mmap_size, istate->cache_nr)); */
-    istate->initialized = 1;
 
     src_offset = sizeof(*hdr);
     for (i = 0; i < istate->cache_nr; i++) {
@@ -466,20 +464,6 @@ void mark_all_ce_unused(struct index_state *index)
 }
 
 
-static int is_empty_blob_sha1(const unsigned char *sha1)
-{
-    /* static const unsigned char empty_blob_sha1[20] = { */
-    /*     0xe6,0x9d,0xe2,0x9b,0xb2,0xd1,0xd6,0x43,0x4b,0x8b, */
-    /*     0x29,0xae,0x77,0x5a,0xd8,0xc2,0xe4,0x8c,0x53,0x91 */
-    /* }; */
-
-    static const unsigned char empty_blob_sha1[20] = {
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-    };
-    return !hashcmp(sha1, empty_blob_sha1);
-}
-
 static int ce_match_stat_basic(struct cache_entry *ce, SeafStat *st)
 {
     unsigned int changed = 0;
@@ -510,13 +494,16 @@ static int ce_match_stat_basic(struct cache_entry *ce, SeafStat *st)
         /*     changed |= DATA_CHANGED; */
         return changed;
     default:
-        g_warning("internal error: ce_mode is %o\n", ce->ce_mode);
+        seaf_warning("internal error: ce_mode is %o\n", ce->ce_mode);
         return -1;
     }
     if (ce->ce_mtime.sec != st->st_mtime)
         changed |= MTIME_CHANGED;
-    if (ce->ce_ctime.sec != st->st_ctime)
-        changed |= CTIME_CHANGED;
+    /* if (ce->ce_ctime.sec != st->st_ctime) */
+    /*     changed |= CTIME_CHANGED; */
+
+    if (ce->ce_size != st->st_size)
+        changed |= DATA_CHANGED;
 
 #if 0
     if (ce->ce_uid != (unsigned int) st->st_uid ||
@@ -524,9 +511,6 @@ static int ce_match_stat_basic(struct cache_entry *ce, SeafStat *st)
         changed |= OWNER_CHANGED;
     if (ce->ce_ino != (unsigned int) st->st_ino)
         changed |= INODE_CHANGED;
-
-    if (ce->ce_size != st->st_size)
-        changed |= DATA_CHANGED;
 
     /* Racily smudged entry? */
     if (!ce->ce_size) {
@@ -740,17 +724,21 @@ void remove_marked_cache_entries(struct index_state *istate)
 {
     struct cache_entry **ce_array = istate->cache;
     unsigned int i, j;
+    gboolean removed = FALSE;
 
     for (i = j = 0; i < istate->cache_nr; i++) {
         if (ce_array[i]->ce_flags & CE_REMOVE) {
             remove_name_hash(istate, ce_array[i]);
             cache_entry_free (ce_array[i]);
+            removed = TRUE;
         } else {
             ce_array[j++] = ce_array[i];
         }
     }
-    istate->cache_changed = 1;
-    istate->cache_nr = j;
+    if (removed) {
+        istate->cache_changed = 1;
+        istate->cache_nr = j;
+    }
 }
 
 int remove_file_from_index(struct index_state *istate, const char *path)
@@ -860,6 +848,28 @@ int verify_path(const char *path)
     }
 }
 
+void remove_empty_parent_dir_entry (struct index_state *istate, const char *path)
+{
+    char *parent = g_strdup(path);
+    char *slash;
+
+    /* Find and remove empty dir entry from low level to top level. */
+    while (1) {
+        slash = strrchr (parent, '/');
+        if (!slash)
+            break;
+
+        *slash = 0;
+
+        if (index_name_exists (istate, parent, strlen(parent), 0) != NULL) {
+            remove_file_from_index (istate, parent);
+            break;
+        }
+    }
+
+    g_free (parent);
+}
+
 static int add_index_entry_with_check(struct index_state *istate, struct cache_entry *ce, int option)
 {
     int pos;
@@ -867,6 +877,8 @@ static int add_index_entry_with_check(struct index_state *istate, struct cache_e
     /* int ok_to_replace = option & ADD_CACHE_OK_TO_REPLACE; */
     /* int skip_df_check = option & ADD_CACHE_SKIP_DFCHECK; */
     int new_only = option & ADD_CACHE_NEW_ONLY;
+
+    remove_empty_parent_dir_entry (istate, ce->name);
 
     pos = index_name_pos(istate, ce->name, ce->ce_flags);
 
@@ -877,27 +889,6 @@ static int add_index_entry_with_check(struct index_state *istate, struct cache_e
         return 0;
     }
     pos = -pos-1;
-
-    /*
-     * If an empty dir entry exsits in the index and it's the parent of
-     * the entry to be inserted, remove the empty dir entry.
-     */
-    int i = pos - 1;
-    struct cache_entry *prev;
-    if (i >= 0) {
-        prev = istate->cache[i];
-
-        if (S_ISDIR(prev->ce_mode)) {
-            char *full_name = g_strconcat (prev->name, "/", NULL);
-            int len1 = strlen(full_name);
-            int len2 = strlen(ce->name);
-            if (len1 < len2 && strncmp (ce->name, full_name, len1) == 0) {
-                remove_index_entry_at (istate, i);
-                pos = pos - 1;
-            }
-            g_free (full_name);
-        }
-    }
 
     /*
      * Inserting a merged entry ("stage 0") into the index
@@ -914,7 +905,7 @@ static int add_index_entry_with_check(struct index_state *istate, struct cache_e
     if (!ok_to_add)
         return -1;
     /* if (!verify_path(ce->name)) { */
-    /*     g_warning("Invalid path '%s'\n", ce->name); */
+    /*     seaf_warning("Invalid path '%s'\n", ce->name); */
     /*     return -1; */
     /* } */
 
@@ -983,7 +974,7 @@ int add_to_index(const char *repo_id,
     *added = FALSE;
 
     if (!S_ISREG(st_mode) && !S_ISLNK(st_mode) && !S_ISDIR(st_mode)) {
-        g_warning("%s: can only add regular files, symbolic links or git-directories\n", path);
+        seaf_warning("%s: can only add regular files, symbolic links or git-directories\n", path);
         return -1;
     }
 
@@ -1003,11 +994,7 @@ int add_to_index(const char *repo_id,
     alias = index_name_exists(istate, ce->name, ce_namelen(ce), 0);
     if (alias) {
         if (!ce_stage(alias) && !ie_match_stat(alias, st, ce_option)) {
-            /* Nothing changed, really */
             free(ce);
-            if (!S_ISGITLINK(alias->ce_mode))
-                ce_mark_uptodate(alias);
-            alias->ce_flags |= CE_ADDED;
             return 0;
         }
     } else {
@@ -1031,6 +1018,7 @@ int add_to_index(const char *repo_id,
         ce->ce_mode = alias->ce_mode;
 #endif
 
+#if 0
 #ifdef WIN32
     /* Fix daylight saving time bug on Windows.
      * See http://www.codeproject.com/Articles/1144/Beating-the-Daylight-Savings-Time-bug-and-getting
@@ -1049,24 +1037,27 @@ int add_to_index(const char *repo_id,
             goto update_index;
     }
 #endif
+#endif  /* 0 */
 
-    /* Skip index file errors. */
     if (index_cb (repo_id, version, full_path, sha1, crypt, TRUE) < 0) {
         free (ce);
-        return 0;
+        return -1;
     }
 
-update_index:
     memcpy (ce->sha1, sha1, 20);
     ce->ce_flags |= CE_ADDED;
     ce->modifier = g_strdup(modifier);
 
     if (add_index_entry(istate, ce, add_option)) {
-        g_warning("unable to add %s to index\n",path);
+        seaf_warning("unable to add %s to index\n",path);
         return -1;
     }
 
+    /* As long as the timestamp or mode is changed, we consider
+       the cache enrty as changed. This has been tested by ie_match_stat().
+    */
     *added = TRUE;
+
     return 0;
 }
 
@@ -1090,23 +1081,27 @@ static int is_garbage_empty_dir (struct index_state *istate, struct cache_entry 
     struct cache_entry *next;
     char *dir_name = g_strconcat (ce->name, "/", NULL);
     int this_len = strlen (ce->name) + 1;
-    if (pos < istate->cache_nr) {
+    while (pos < istate->cache_nr) {
         next = istate->cache[pos];
-        int rc = strncmp (dir_name, next->name, this_len);
-        if (rc == 0)
+        int rc = strncmp (next->name, dir_name, this_len);
+        if (rc == 0) {
             ret = 1;
+            break;
+        } else if (rc < 0) {
+            ++pos;
+        } else
+            break;
     }
 
     g_free (dir_name);
     return ret;
 }
 
-int
-add_empty_dir_to_index (struct index_state *istate, const char *path, SeafStat *st)
+static struct cache_entry *
+create_empty_dir_index_entry (const char *path, SeafStat *st)
 {
     int namelen, size;
-    struct cache_entry *ce, *alias;
-    int add_option = (ADD_CACHE_OK_TO_ADD|ADD_CACHE_OK_TO_REPLACE);
+    struct cache_entry *ce;
 
     namelen = strlen(path);
     size = cache_entry_size(namelen);
@@ -1119,6 +1114,17 @@ add_empty_dir_to_index (struct index_state *istate, const char *path, SeafStat *
 
     ce->ce_mode = S_IFDIR;
     /* sha1 is all-zero. */
+
+    return ce;
+}
+
+int
+add_empty_dir_to_index (struct index_state *istate, const char *path, SeafStat *st)
+{
+    struct cache_entry *ce, *alias;
+    int add_option = (ADD_CACHE_OK_TO_ADD|ADD_CACHE_OK_TO_REPLACE);
+
+    ce = create_empty_dir_index_entry (path, st);
 
     if (is_garbage_empty_dir (istate, ce)) {
         free (ce);
@@ -1142,20 +1148,27 @@ add_empty_dir_to_index (struct index_state *istate, const char *path, SeafStat *
 #endif
     }
 
+    ce->ce_flags |= CE_ADDED;
+
     if (add_index_entry(istate, ce, add_option)) {
-        g_warning("unable to add %s to index\n",path);
+        seaf_warning("unable to add %s to index\n",path);
         free (ce);
         return -1;
     }
 
-    return 0;
+    return 1;
 }
 
 int
-remove_from_index_with_prefix (struct index_state *istate, const char *path_prefix)
+remove_from_index_with_prefix (struct index_state *istate, const char *path_prefix,
+                               gboolean *not_found)
 {
     int pathlen = strlen(path_prefix);
     int pos = index_name_pos (istate, path_prefix, pathlen);
+    struct cache_entry *ce;
+
+    if (not_found)
+        *not_found = FALSE;
 
     /* Exact match, remove that entry. */
     if (pos >= 0) {
@@ -1177,7 +1190,21 @@ remove_from_index_with_prefix (struct index_state *istate, const char *path_pref
     char *full_path_prefix = g_strconcat (path_prefix, "/", NULL);
     ++pathlen;
 
-    struct cache_entry *ce;
+    while (pos < istate->cache_nr) {
+        ce = istate->cache[pos];
+        if (strncmp (ce->name, full_path_prefix, pathlen) < 0) {
+            ++pos;
+        } else
+            break;
+    }
+
+    if (pos == istate->cache_nr) {
+        g_free (full_path_prefix);
+        if (not_found)
+            *not_found = TRUE;
+        return 0;
+    }
+
     int i = pos;
     while (i < istate->cache_nr) {
         ce = istate->cache[i];
@@ -1191,8 +1218,11 @@ remove_from_index_with_prefix (struct index_state *istate, const char *path_pref
     g_free (full_path_prefix);
 
     /* No match. */
-    if (i == pos)
+    if (i == pos) {
+        if (not_found)
+            *not_found = TRUE;
         return 0;
+    }
 
     if (i < istate->cache_nr)
         memmove (istate->cache + pos,
@@ -1231,7 +1261,9 @@ create_renamed_cache_entry (struct cache_entry *ce,
 static struct cache_entry **
 create_renamed_cache_entries (struct index_state *istate,
                               const char *src_path, const char *dst_path,
-                              int *n_entries)
+                              int *n_entries,
+                              CECallback cb_after_rename,
+                              void *user_data)
 {
     struct cache_entry *ce, **ret = NULL;
 
@@ -1264,8 +1296,21 @@ create_renamed_cache_entries (struct index_state *istate,
     char *full_src_path = g_strconcat (src_path, "/", NULL);
     ++src_pathlen;
 
-    int i = pos;
+    while (pos < istate->cache_nr) {
+        ce = istate->cache[pos];
+        if (strncmp (ce->name, full_src_path, src_pathlen) < 0) {
+            ++pos;
+        } else
+            break;
+    }
 
+    if (pos == istate->cache_nr) {
+        g_free (full_src_path);
+        *n_entries = 0;
+        return NULL;
+    }
+
+    int i = pos;
     while (i < istate->cache_nr) {
         ce = istate->cache[i];
         if (strncmp (ce->name, full_src_path, src_pathlen) == 0) {
@@ -1288,6 +1333,9 @@ create_renamed_cache_entries (struct index_state *istate,
 
         ret[i - pos] = create_renamed_cache_entry (ce, src_path, dst_path);
 
+        if (cb_after_rename)
+            cb_after_rename (ret[i-pos], user_data);
+
         remove_name_hash(istate, ce);
         cache_entry_free (ce);
     }
@@ -1305,53 +1353,51 @@ create_renamed_cache_entries (struct index_state *istate,
 int
 rename_index_entries (struct index_state *istate,
                       const char *src_path,
-                      const char *dst_path)
+                      const char *dst_path,
+                      gboolean *not_found,
+                      CECallback cb_after_rename,
+                      void *cb_data)
 {
     struct cache_entry **new_ces;
     int n_entries;
     int ret = 0;
     int i;
 
-    new_ces = create_renamed_cache_entries (istate, src_path, dst_path, &n_entries);
+    if (not_found)
+        *not_found = FALSE;
+
+    new_ces = create_renamed_cache_entries (istate, src_path, dst_path, &n_entries,
+                                            cb_after_rename, cb_data);
     if (n_entries == 0) {
+        if (not_found)
+            *not_found = TRUE;
         return 0;
     }
 
     /* Remove entries under dst_path. It's necessary for the situation that
      * one file is renamed to overwrite another file.
      */
-    remove_from_index_with_prefix (istate, dst_path);
+    remove_from_index_with_prefix (istate, dst_path, NULL);
+
+    remove_empty_parent_dir_entry (istate, dst_path);
 
     /* Insert the renamed entries to their position. */
     int dst_pathlen = strlen(dst_path);
     int pos = index_name_pos (istate, dst_path, dst_pathlen);
     if (pos >= 0) {
-        g_warning ("BUG: %s should not exist in index after remove.\n", dst_path);
+        seaf_warning ("BUG: %s should not exist in index after remove.\n", dst_path);
         ret = -1;
         goto out;
     }
 
     pos = -pos-1;
 
-    /* Moving a file may turn an empty dir into non-empty. */
-    if (pos > 0) {
-        struct cache_entry *prev = istate->cache[pos-1];
-        char *full_name = g_strconcat (prev->name, "/", NULL);
-
-        if (S_ISDIR(prev->ce_mode) &&
-            strncmp(full_name, dst_path, strlen(full_name)) == 0) {
-            remove_index_entry_at (istate, pos-1);
-            pos = pos - 1;
-        }
-        g_free (full_name);
-    }
-
     /* There should be at least n_entries free room in istate->cache array,
      * since we just removed n_entries from the index in
      * create_renamed_cache_entires(). 
      */
     if (istate->cache_alloc - istate->cache_nr < n_entries) {
-        g_warning ("BUG: not enough room to insert renamed entries.\n"
+        seaf_warning ("BUG: not enough room to insert renamed entries.\n"
                    "cache_alloc: %u, cache_nr: %u, n_entries: %d.\n",
                    istate->cache_alloc, istate->cache_nr, n_entries);
         ret = -1;
@@ -1379,13 +1425,209 @@ out:
     return ret;
 }
 
+/*
+ * If there is no file under @path, add an empty dir entry for this @path.
+ */
+int
+add_empty_dir_to_index_with_check (struct index_state *istate,
+                                   const char *path, SeafStat *st)
+{
+    int pathlen = strlen(path);
+    int pos = index_name_pos (istate, path, pathlen);
+    struct cache_entry *ce;
+
+    /* Exact match, empty dir entry already exists. */
+    if (pos >= 0) {
+        return 0;
+    }
+
+    /* Otherwise it may be a prefix match, remove all entries begin with this prefix.
+     */
+
+    /* -pos = (the position this entry *should* be) + 1.
+     * So -pos-1 is the first entry larger than this entry.
+     */
+    pos = -pos-1;
+
+    /* Add '/' to the end of prefix so that we won't match a partial path component.
+     * e.g. we don't want to match 'abc' with 'abcd/ef'
+     */
+    char *full_path = g_strconcat (path, "/", NULL);
+    ++pathlen;
+
+    gboolean is_empty = TRUE;
+
+    while (pos < istate->cache_nr) {
+        ce = istate->cache[pos];
+        int rc = strncmp (ce->name, full_path, pathlen);
+        if (rc < 0) {
+            ++pos;
+        } else if (rc == 0) {
+            is_empty = FALSE;
+            break;
+        } else
+            break;
+    }
+
+    g_free (full_path);
+
+    if (is_empty) {
+        ce = create_empty_dir_index_entry (path, st);
+
+        /* Make sure the array is big enough .. */
+        if (istate->cache_nr == istate->cache_alloc) {
+            istate->cache_alloc = alloc_nr(istate->cache_alloc);
+            istate->cache = realloc(istate->cache,
+                                    istate->cache_alloc * sizeof(struct cache_entry *));
+        }
+
+        /* Add it in.. */
+        istate->cache_nr++;
+        if (istate->cache_nr > pos + 1)
+            memmove(istate->cache + pos + 1,
+                    istate->cache + pos,
+                    (istate->cache_nr - pos - 1) * sizeof(ce));
+        set_index_entry(istate, pos, ce);
+        istate->cache_changed = 1;
+    }
+
+    return 0;
+}
+
+inline static gboolean
+is_duplicate_dirent (GList *dirents, const char *dname)
+{
+    if (!dirents)
+        return FALSE;
+
+    IndexDirent *dent = dirents->data;
+
+    return (strcmp(dent->dname, dname) == 0);
+}
+
+static IndexDirent *
+index_dirent_new (char *dname, gboolean is_dir, struct cache_entry *ce)
+{
+    IndexDirent *dent = g_new0 (IndexDirent, 1);
+    dent->dname = dname;
+    dent->is_dir = is_dir;
+    if (!is_dir)
+        dent->ce = ce;
+    return dent;
+}
+
+void
+index_dirent_free (IndexDirent *dent)
+{
+    if (!dent)
+        return;
+
+    g_free (dent->dname);
+    g_free (dent);
+}
+
+static gint
+compare_index_dents (gconstpointer a, gconstpointer b)
+{
+    const IndexDirent *denta = a, *dentb = b;
+
+    return (strcmp(denta->dname, dentb->dname));
+}
+
+GList *
+list_dirents_from_index (struct index_state *istate, const char *dir)
+{
+    char *full_dir;
+    int pathlen;
+    int pos;
+    struct cache_entry *ce;
+    GList *dirents = NULL;
+    char *path, *slash, *dname;
+    gboolean is_dir;
+    IndexDirent *dirent;
+
+    if (dir[0] == 0) {
+        pos = 0;
+        full_dir = g_strdup(dir);
+        pathlen = 0;
+        goto collect_dents;
+    } else {
+        pathlen = strlen(dir);
+        pos = index_name_pos (istate, dir, pathlen);
+    }
+
+    /* Exact match, it's an empty dir. */
+    if (pos >= 0) {
+        return NULL;
+    }
+
+    /* Otherwise it may be a prefix match, there may be dirents under the dir.
+     */
+
+    /* -pos = (the position this entry *should* be) + 1.
+     * So -pos-1 is the first entry larger than this entry.
+     */
+    pos = -pos-1;
+
+    /* Add '/' to the end of prefix so that we won't match a partial path component.
+     * e.g. we don't want to match 'abc' with 'abcd/ef'
+     */
+    full_dir = g_strconcat (dir, "/", NULL);
+    ++pathlen;
+
+    while (pos < istate->cache_nr) {
+        ce = istate->cache[pos];
+        if (strncmp (ce->name, full_dir, pathlen) < 0) {
+            ++pos;
+        } else
+            break;
+    }
+
+    /* The dir actually doesn't exist. */
+    if (pos == istate->cache_nr) {
+        g_free (full_dir);
+        return NULL;
+    }
+
+collect_dents:
+    for (; pos < istate->cache_nr; ++pos) {
+        ce = istate->cache[pos];
+
+        if (strncmp (full_dir, ce->name, pathlen) != 0)
+            break;
+
+        path = ce->name + pathlen;
+        slash = strchr(path, '/');
+        if (slash) {
+            dname = g_strndup(path, slash - path);
+            if (is_duplicate_dirent (dirents, dname)) {
+                g_free (dname);
+                continue;
+            }
+
+            dirent = index_dirent_new (dname, TRUE, NULL);
+            dirents = g_list_prepend (dirents, dirent);
+        } else {
+            dname = g_strdup(path);
+            is_dir = S_ISDIR(ce->ce_mode);
+            dirent = index_dirent_new (dname, is_dir, ce);
+            dirents = g_list_prepend (dirents, dirent);
+        }
+    }
+
+    dirents = g_list_sort (dirents, compare_index_dents);
+
+    g_free (full_dir);
+    return dirents;
+}
+
 static struct cache_entry *refresh_cache_entry(struct cache_entry *ce,
                                                const char *full_path)
 {
     SeafStat st;
 
     if (seaf_stat (full_path, &st) < 0) {
-        g_warning("Failed to stat %s.\n", full_path);
+        seaf_warning("Failed to stat %s.\n", full_path);
         return NULL;
     }
     fill_stat_cache_info(ce, &st);
@@ -1402,7 +1644,7 @@ struct cache_entry *make_cache_entry(unsigned int mode,
     struct cache_entry *ce;
 
     /* if (!verify_path(path)) { */
-    /*     g_warning("Invalid path '%s'", path); */
+    /*     seaf_warning("Invalid path '%s'", path); */
     /*     return NULL; */
     /* } */
 
@@ -1427,7 +1669,7 @@ int add_file_to_index(struct index_state *istate, const char *path, int flags)
 {
     SeafStat st;
     if (seaf_stat (path, &st)) {
-        g_warning("unable to stat '%s'\n", path);
+        seaf_warning("unable to stat '%s'\n", path);
         return -1;
     }
     return add_to_index(istate, path, &st, flags);
@@ -1459,7 +1701,7 @@ static int type_from_string(const char *str)
     for (i = 1; i < ARRAY_SIZE(object_type_strings); i++)
         if (!strcmp(str, object_type_strings[i]))
             return i;
-    g_warning("invalid object type \"%s\"\n", str);
+    seaf_warning("invalid object type \"%s\"\n", str);
     return -1;
 }
 #endif
@@ -1467,12 +1709,14 @@ static int type_from_string(const char *str)
 static void hash_sha1_file(const void *buf, unsigned long len,
                            const char *type, unsigned char *sha1)
 {
-    SHA_CTX c;
+    GChecksum *c;
+    gsize cs_len = 20;
 
     /* Sha1.. */
-    SHA1_Init(&c);
-    SHA1_Update(&c, buf, len);
-    SHA1_Final(sha1, &c);
+    c = g_checksum_new (G_CHECKSUM_SHA1);
+    g_checksum_update(c, buf, len);
+    g_checksum_get_digest (c, sha1, &cs_len);
+    g_checksum_free (c);
 }
 
 static int index_mem(unsigned char *sha1, void *buf, uint64_t size,
@@ -1500,7 +1744,7 @@ int index_fd(unsigned char *sha1, int fd, SeafStat *st,
         if (size == readn(fd, buf, size)) {
             ret = index_mem(sha1, buf, size, type, path);
         } else {
-            g_warning("short read %s\n", strerror(errno));
+            seaf_warning("short read %s\n", strerror(errno));
             ret = -1;
         }
         free(buf);
@@ -1521,9 +1765,9 @@ int index_path(unsigned char *sha1, const char *path, SeafStat *st)
 
     switch (st->st_mode & S_IFMT) {
     case S_IFREG:
-        fd = g_open (path, O_RDONLY | O_BINARY, 0);
+        fd = seaf_util_open (path, O_RDONLY | O_BINARY);
         if (fd < 0) {
-            g_warning("g_open (\"%s\"): %s\n", path, strerror(errno));
+            seaf_warning("g_open (\"%s\"): %s\n", path, strerror(errno));
             return -1;
         }
         if (index_fd(sha1, fd, st, OBJ_BLOB, path) < 0) {
@@ -1535,14 +1779,14 @@ int index_path(unsigned char *sha1, const char *path, SeafStat *st)
         pathlen = readlink(path, buf, SEAF_PATH_MAX);
         if (pathlen != st->st_size) {
             char *errstr = strerror(errno);
-            g_warning("readlink(\"%s\"): %s\n", path, errstr);
+            seaf_warning("readlink(\"%s\"): %s\n", path, errstr);
             return -1;
         }
         hash_sha1_file(buf, pathlen, typename(OBJ_BLOB), sha1);
         break;
 #endif        
     default:
-        g_warning("%s: unsupported file type\n", path);
+        seaf_warning("%s: unsupported file type\n", path);
         return -1;
     }
     return 0;
@@ -1556,7 +1800,7 @@ static unsigned long write_buffer_len;
 #define WRITE_BUFFER_SIZE 8192
 
 typedef struct {
-    SHA_CTX context;
+    GChecksum *context;
     unsigned char write_buffer[WRITE_BUFFER_SIZE];
     unsigned long write_buffer_len;
 } WriteIndexInfo;
@@ -1565,7 +1809,7 @@ static int ce_write_flush(WriteIndexInfo *info, int fd)
 {
     unsigned int buffered = info->write_buffer_len;
     if (buffered) {
-        SHA1_Update(&info->context, info->write_buffer, buffered);
+        g_checksum_update(info->context, info->write_buffer, buffered);
         if (writen(fd, info->write_buffer, buffered) != buffered)
             return -1;
         info->write_buffer_len = 0;
@@ -1607,10 +1851,11 @@ static int write_index_ext_header(WriteIndexInfo *info, int fd,
 static int ce_flush(WriteIndexInfo *info, int fd)
 {
     unsigned int left = info->write_buffer_len;
+    gsize len = 20;
 
     if (left) {
         info->write_buffer_len = 0;
-        SHA1_Update(&info->context, info->write_buffer, left);
+        g_checksum_update(info->context, info->write_buffer, left);
     }
 
     /* Flush first if not enough space for SHA1 signature */
@@ -1621,7 +1866,7 @@ static int ce_flush(WriteIndexInfo *info, int fd)
     }
 
     /* Append the SHA1 signature at the end */
-    SHA1_Final(info->write_buffer + left, &info->context);
+    g_checksum_get_digest (info->context, info->write_buffer + left, &len);
     left += 20;
     return (writen(fd, info->write_buffer, left) != left) ? -1 : 0;
 }
@@ -1676,38 +1921,6 @@ static void ce_smudge_racily_clean_entry(struct cache_entry *ce)
 }
 #endif
 
-static int ce_write_entry(WriteIndexInfo *info, int fd, struct cache_entry *ce)
-{
-    int size = ondisk_ce_size(ce);
-    struct ondisk_cache_entry *ondisk = calloc(1, size);
-    char *name;
-    int result;
-
-    ondisk->ctime.sec = htonl((unsigned int)ce->ce_ctime.sec);
-    ondisk->mtime.sec = htonl((unsigned int)ce->ce_mtime.sec);
-    ondisk->dev  = htonl(ce->ce_dev);
-    ondisk->ino  = htonl(ce->ce_ino);
-    ondisk->mode = htonl(ce->ce_mode);
-    ondisk->uid  = htonl(ce->ce_uid);
-    ondisk->gid  = htonl(ce->ce_gid);
-    ondisk->size = hton64(ce->ce_size);
-    hashcpy(ondisk->sha1, ce->sha1);
-    ondisk->flags = htons(ce->ce_flags);
-    /* if (ce->ce_flags & CE_EXTENDED) { */
-    /*     struct ondisk_cache_entry_extended *ondisk2; */
-    /*     ondisk2 = (struct ondisk_cache_entry_extended *)ondisk; */
-    /*     ondisk2->flags2 = htons((ce->ce_flags & CE_EXTENDED_FLAGS) >> 16); */
-    /*     name = ondisk2->name; */
-    /* } */
-    /* else */
-    name = ondisk->name;
-    memcpy(name, ce->name, ce_namelen(ce));
-
-    result = ce_write(info, fd, ondisk, size);
-    free(ondisk);
-    return result;
-}
-
 static int ce_write_entry2(WriteIndexInfo *info, int fd, struct cache_entry *ce)
 {
     int size = ondisk_ce_size2(ce);
@@ -1744,7 +1957,7 @@ modifiers_to_string (GString *buf, struct index_state *istate)
         if (S_ISDIR(ce->ce_mode) || (ce->ce_flags & CE_REMOVE))
             continue;
         if (!ce->modifier) {
-            g_warning ("BUG: index entry %s doesn't have modifier info.\n",
+            seaf_warning ("BUG: index entry %s doesn't have modifier info.\n",
                        ce->name);
             return -1;
         }
@@ -1762,6 +1975,7 @@ int write_index(struct index_state *istate, int newfd)
     struct cache_entry **cache = istate->cache;
     int entries = istate->cache_nr;
     SeafStat st;
+    int ret = 0;
 
     memset (&info, 0, sizeof(info));
 
@@ -1782,9 +1996,11 @@ int write_index(struct index_state *istate, int newfd)
     hdr.hdr_version = htonl(4);
     hdr.hdr_entries = htonl(entries - removed);
 
-    SHA1_Init(&info.context);
-    if (ce_write(&info, newfd, &hdr, sizeof(hdr)) < 0)
-        return -1;
+    info.context = g_checksum_new (G_CHECKSUM_SHA1);
+    if (ce_write(&info, newfd, &hdr, sizeof(hdr)) < 0) {
+        ret = -1;
+        goto out;
+    }
 
     for (i = 0; i < entries; i++) {
         struct cache_entry *ce = cache[i];
@@ -1792,8 +2008,10 @@ int write_index(struct index_state *istate, int newfd)
             continue;
         /* if (!ce_uptodate(ce) && is_racy_timestamp(istate, ce)) */
         /*     ce_smudge_racily_clean_entry(ce); */
-        if (ce_write_entry2(&info, newfd, ce) < 0)
-            return -1;
+        if (ce_write_entry2(&info, newfd, ce) < 0) {
+            ret = -1;
+            goto out;
+        }
     }
 
     /* Write extension data here */
@@ -1803,21 +2021,30 @@ int write_index(struct index_state *istate, int newfd)
 
         if (modifiers_to_string (buf, istate) < 0) {
             g_string_free (buf, TRUE);
-            return -1;
+            ret = -1;
+            goto out;
         }
 
         err = write_index_ext_header(&info, newfd, CACHE_EXT_MODIFIER, buf->len) < 0
             || ce_write(&info, newfd, buf->str, buf->len) < 0;
         g_string_free (buf, TRUE);
-        if (err)
-            return -1;
+        if (err) {
+            ret = -1;
+            goto out;
+        }
     }
 
-    if (ce_flush(&info, newfd) || seaf_fstat(newfd, &st))
-        return -1;
+    if (ce_flush(&info, newfd) || seaf_fstat(newfd, &st)) {
+        ret = -1;
+        goto out;
+    }
+
     istate->timestamp.sec = (unsigned int)st.st_mtime;
     istate->timestamp.nsec = 0;
-    return 0;
+
+out:
+    g_checksum_free (info.context);
+    return ret;
 }
 
 int discard_index(struct index_state *istate)

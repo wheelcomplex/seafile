@@ -20,9 +20,9 @@ seafile_object_gen = $(seafile_object_define:.vala=.c)
 
 valac_gen = ${seafile_object_gen} seafile-object.h
 
-EXTRA_DIST = ${seafile_object_define} rpc_table.py $(pcfiles)
+EXTRA_DIST = ${seafile_object_define} rpc_table.py $(pcfiles) vala.stamp
 
-utils_headers = net.h rsa.h bloom-filter.h utils.h db.h
+utils_headers = net.h utils.h db.h
 
 utils_srcs = $(utils_headers:.h=.c)
 
@@ -51,7 +51,7 @@ noinst_LTLIBRARIES = libseafile_common.la
 
 libseafile_common_la_SOURCES = ${seafile_object_gen} ${utils_srcs}
 libseafile_common_la_LDFLAGS = -no-undefined
-libseafile_common_la_LIBADD = @GLIB2_LIBS@  @GOBJECT_LIBS@ @SSL_LIBS@ -lcrypto @LIB_GDI32@ \
+libseafile_common_la_LIBADD = @GLIB2_LIBS@  @GOBJECT_LIBS@ @LIB_GDI32@ \
 				     @LIB_UUID@ @LIB_WS32@ @LIB_PSAPI@ -lsqlite3 \
 					 @LIBEVENT_LIBS@ @SEARPC_LIBS@ @LIB_SHELL32@ \
 	@ZLIB_LIBS@

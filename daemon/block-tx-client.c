@@ -1,4 +1,11 @@
+/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+
 #include "common.h"
+
+#include "block-tx-client.h"
+
+#ifndef USE_GPL_CRYPTO
+
 #define DEBUG_FLAG SEAFILE_DEBUG_TRANSFER
 #include "log.h"
 
@@ -13,7 +20,6 @@
 #include <ccnet/job-mgr.h>
 
 #include "seafile-session.h"
-#include "block-tx-client.h"
 #include "block-tx-utils.h"
 #include "utils.h"
 
@@ -307,7 +313,7 @@ handle_auth_rsp_content_cb (char *content, int clen, void *cbarg)
 
         if (!client->info->transfer_once) {
             int rsp = BLOCK_CLIENT_READY;
-            pipewrite (client->info->done_pipe[1], &rsp, sizeof(rsp));
+            pipewrite (client->info->done_pipe[1], (char*)&rsp, sizeof(rsp));
         }
 
         /* If in interactive mode, wait for TRANSFER command to start transfer. */
@@ -341,7 +347,7 @@ static int
 send_authentication (BlockTxClient *client)
 {
     TransferTask *task = client->info->task;
-    EVP_CIPHER_CTX ctx;
+    EVP_CIPHER_CTX *ctx;
     int ret = 0;
 
     if (client->version == 1)
@@ -359,7 +365,7 @@ send_authentication (BlockTxClient *client)
         goto out;
     }
 
-    if (send_encrypted_data (&ctx, client->data_fd,
+    if (send_encrypted_data (ctx, client->data_fd,
                              task->session_token,
                              strlen(task->session_token) + 1) < 0)
     {
@@ -369,7 +375,7 @@ send_authentication (BlockTxClient *client)
         goto out;
     }
 
-    if (send_encrypted_data_frame_end (&ctx, client->data_fd) < 0) {
+    if (send_encrypted_data_frame_end (ctx, client->data_fd) < 0) {
         seaf_warning ("Send auth request: failed to end.\n");
         client->info->result = BLOCK_CLIENT_NET_ERROR;
         ret = -1;
@@ -382,7 +388,7 @@ send_authentication (BlockTxClient *client)
     client->recv_state = RECV_STATE_AUTH;
 
 out:
-    EVP_CIPHER_CTX_cleanup (&ctx);
+    EVP_CIPHER_CTX_free (ctx);
     return ret;
 }
 
@@ -392,7 +398,7 @@ static int
 send_block_header (BlockTxClient *client, int command)
 {
     RequestHeader header;
-    EVP_CIPHER_CTX ctx;
+    EVP_CIPHER_CTX *ctx;
     int ret = 0;
 
     header.command = htonl (command);
@@ -411,7 +417,7 @@ send_block_header (BlockTxClient *client, int command)
         goto out;
     }
 
-    if (send_encrypted_data (&ctx, client->data_fd,
+    if (send_encrypted_data (ctx, client->data_fd,
                              &header, sizeof(header)) < 0)
     {
         seaf_warning ("Send block header %s: failed to send data.\n",
@@ -421,7 +427,7 @@ send_block_header (BlockTxClient *client, int command)
         goto out;
     }
 
-    if (send_encrypted_data_frame_end (&ctx, client->data_fd) < 0) {
+    if (send_encrypted_data_frame_end (ctx, client->data_fd) < 0) {
         seaf_warning ("Send block header %s: failed to end.\n",
                       client->curr_block_id);
         client->info->result = BLOCK_CLIENT_NET_ERROR;
@@ -430,7 +436,7 @@ send_block_header (BlockTxClient *client, int command)
     }
 
 out:
-    EVP_CIPHER_CTX_cleanup (&ctx);
+    EVP_CIPHER_CTX_free (ctx);
     return ret;
 }
 
@@ -522,7 +528,7 @@ send_encrypted_block (BlockTxClient *client,
     BlockMetadata *md;
     int size, n, remain;
     int ret = 0;
-    EVP_CIPHER_CTX ctx;
+    EVP_CIPHER_CTX *ctx;
     char send_buf[SEND_BUFFER_SIZE];
 
     md = seaf_block_manager_stat_block_by_handle (seaf->block_mgr, handle);
@@ -565,7 +571,7 @@ send_encrypted_block (BlockTxClient *client,
             goto out;
         }
 
-        if (send_encrypted_data (&ctx, client->data_fd, send_buf, n) < 0) {
+        if (send_encrypted_data (ctx, client->data_fd, send_buf, n) < 0) {
             seaf_warning ("Send block %s: failed to send data.\n", block_id);
             info->result = BLOCK_CLIENT_NET_ERROR;
             ret = -1;
@@ -574,7 +580,7 @@ send_encrypted_block (BlockTxClient *client,
 
         /* Update global transferred bytes. */
         g_atomic_int_add (&(info->task->tx_bytes), n);
-        g_atomic_int_add (&(seaf->transfer_mgr->sent_bytes), n);
+        g_atomic_int_add (&(seaf->sync_mgr->sent_bytes), n);
 
         /* If uploaded bytes exceeds the limit, wait until the counter
          * is reset. We check the counter every 100 milliseconds, so we
@@ -582,9 +588,9 @@ send_encrypted_block (BlockTxClient *client,
          * the counter is reset.
          */
         while (1) {
-            gint sent = g_atomic_int_get(&(seaf->transfer_mgr->sent_bytes));
-            if (seaf->transfer_mgr->upload_limit > 0 &&
-                sent > seaf->transfer_mgr->upload_limit)
+            gint sent = g_atomic_int_get(&(seaf->sync_mgr->sent_bytes));
+            if (seaf->sync_mgr->upload_limit > 0 &&
+                sent > seaf->sync_mgr->upload_limit)
                 /* 100 milliseconds */
                 g_usleep (100000);
             else
@@ -594,7 +600,7 @@ send_encrypted_block (BlockTxClient *client,
         remain -= n;
     }
 
-    if (send_encrypted_data_frame_end (&ctx, client->data_fd) < 0) {
+    if (send_encrypted_data_frame_end (ctx, client->data_fd) < 0) {
         seaf_warning ("Send block %s: failed to end.\n", block_id);
         info->result = BLOCK_CLIENT_NET_ERROR;
         ret = -1;
@@ -602,7 +608,7 @@ send_encrypted_block (BlockTxClient *client,
     }
 
 out:
-    EVP_CIPHER_CTX_cleanup (&ctx);
+    EVP_CIPHER_CTX_free (ctx);
     return ret;
 }
 
@@ -648,12 +654,12 @@ save_block_content_cb (char *content, int clen, int end, void *cbarg)
 
     /* Update global transferred bytes. */
     g_atomic_int_add (&(task->tx_bytes), clen);
-    g_atomic_int_add (&(seaf->transfer_mgr->recv_bytes), clen);
+    g_atomic_int_add (&(seaf->sync_mgr->recv_bytes), clen);
 
     while (1) {
-        gint recv_bytes = g_atomic_int_get (&(seaf->transfer_mgr->recv_bytes));
-        if (seaf->transfer_mgr->download_limit > 0 &&
-            recv_bytes > seaf->transfer_mgr->download_limit) {
+        gint recv_bytes = g_atomic_int_get (&(seaf->sync_mgr->recv_bytes));
+        if (seaf->sync_mgr->download_limit > 0 &&
+            recv_bytes > seaf->sync_mgr->download_limit) {
             g_usleep (100000);
         } else {
             break;
@@ -802,7 +808,7 @@ shutdown_client (BlockTxClient *client)
     }
 
     if (client->parser.enc_init)
-        EVP_CIPHER_CTX_cleanup (&client->parser.ctx);
+        EVP_CIPHER_CTX_free (client->parser.ctx);
 
     evbuffer_free (client->recv_buf);
     evutil_closesocket (client->data_fd);
@@ -826,7 +832,7 @@ handle_command (BlockTxClient *client, int command)
 
         if (transfer_next_block (client) < 0) {
             rsp = client->info->result;
-            pipewrite (client->info->done_pipe[1], &rsp, sizeof(rsp));
+            pipewrite (client->info->done_pipe[1], (char*)&rsp, sizeof(rsp));
 
             shutdown_client (client);
 
@@ -847,7 +853,7 @@ handle_command (BlockTxClient *client, int command)
             ret = TRUE;
         } else {
             rsp = client->info->result;
-            pipewrite (client->info->done_pipe[1], &rsp, sizeof(rsp));
+            pipewrite (client->info->done_pipe[1], (char*)&rsp, sizeof(rsp));
 
             shutdown_client (client);
 
@@ -861,7 +867,7 @@ handle_command (BlockTxClient *client, int command)
         client->info->result = BLOCK_CLIENT_ENDED;
 
         rsp = client->info->result;
-        pipewrite (client->info->done_pipe[1], &rsp, sizeof(rsp));
+        pipewrite (client->info->done_pipe[1], (char*)&rsp, sizeof(rsp));
 
         /* Don't need to shutdown_client() if it's already called. */
         if (client->recv_state != RECV_STATE_DONE)
@@ -884,7 +890,7 @@ do_break_loop (BlockTxClient *client)
         return TRUE;
     } else {
         int rsp = client->info->result;
-        pipewrite (client->info->done_pipe[1], &rsp, sizeof(rsp));
+        pipewrite (client->info->done_pipe[1], (char*)&rsp, sizeof(rsp));
 
         if (client->info->result != BLOCK_CLIENT_SUCCESS)
             shutdown_client (client);
@@ -895,6 +901,8 @@ do_break_loop (BlockTxClient *client)
     }
 }
 
+#define RECV_TIMEOUT_SEC 45
+
 static gboolean
 client_thread_loop (BlockTxClient *client)
 {
@@ -903,6 +911,7 @@ client_thread_loop (BlockTxClient *client)
     int max_fd = MAX (info->cmd_pipe[0], client->data_fd);
     int rc;
     gboolean restart = FALSE;
+    struct timeval tmo;
 
     while (1) {
         FD_ZERO (&fds);
@@ -915,13 +924,30 @@ client_thread_loop (BlockTxClient *client)
         } else
             max_fd = info->cmd_pipe[0];
 
-        rc = select (max_fd + 1, &fds, NULL, NULL, NULL);
+        /* If the client is already shutdown, no need to add timeout. */
+        if (client->recv_state != RECV_STATE_DONE) {
+            tmo.tv_sec = RECV_TIMEOUT_SEC;
+            tmo.tv_usec = 0;
+            rc = select (max_fd + 1, &fds, NULL, NULL, &tmo);
+        } else {
+            rc = select (max_fd + 1, &fds, NULL, NULL, NULL);
+        }
+
         if (rc < 0 && errno == EINTR) {
             continue;
         } else if (rc < 0) {
             seaf_warning ("select error: %s.\n", strerror(errno));
             client->info->result = BLOCK_CLIENT_FAILED;
             break;
+        } else if (rc == 0) {
+            /* timeout */
+            if (info->task->type == TASK_TYPE_DOWNLOAD) {
+                seaf_warning ("Recv timeout.\n");
+                client->info->result = BLOCK_CLIENT_NET_ERROR;
+                if (do_break_loop (client))
+                    break;
+            }
+            continue;
         }
 
         if (client->recv_state != RECV_STATE_DONE &&
@@ -933,7 +959,7 @@ client_thread_loop (BlockTxClient *client)
 
         if (FD_ISSET (info->cmd_pipe[0], &fds)) {
             int cmd;
-            piperead (info->cmd_pipe[0], &cmd, sizeof(int));
+            piperead (info->cmd_pipe[0], (char*)&cmd, sizeof(int));
 
             if (cmd == BLOCK_CLIENT_CMD_RESTART) {
                 restart = TRUE;
@@ -962,10 +988,10 @@ retry:
     if (data_fd < 0) {
         info->result = BLOCK_CLIENT_NET_ERROR;
         if (!info->transfer_once) {
-            pipewrite (info->done_pipe[1], &info->result, sizeof(info->result));
+            pipewrite (info->done_pipe[1], (char*)&info->result, sizeof(info->result));
             /* Transfer manager always expects an ENDED response. */
             int rsp = BLOCK_CLIENT_ENDED;
-            pipewrite (info->done_pipe[1], &rsp, sizeof(rsp));
+            pipewrite (info->done_pipe[1], (char*)&rsp, sizeof(rsp));
         }
         return vdata;
     }
@@ -973,9 +999,9 @@ retry:
 
     if (send_handshake (data_fd, info) < 0) {
         if (!info->transfer_once) {
-            pipewrite (info->done_pipe[1], &info->result, sizeof(info->result));
+            pipewrite (info->done_pipe[1], (char*)&info->result, sizeof(info->result));
             int rsp = BLOCK_CLIENT_ENDED;
-            pipewrite (info->done_pipe[1], &rsp, sizeof(rsp));
+            pipewrite (info->done_pipe[1], (char*)&rsp, sizeof(rsp));
         }
         evutil_closesocket (client->data_fd);
         return vdata;
@@ -1031,5 +1057,21 @@ block_tx_client_start (BlockTxInfo *info, BlockTxClientDoneCB cb)
 void
 block_tx_client_run_command (BlockTxInfo *info, int command)
 {
-    pipewrite (info->cmd_pipe[1], &command, sizeof(int));
+    pipewrite (info->cmd_pipe[1], (char*)&command, sizeof(int));
 }
+
+#else
+
+int
+block_tx_client_start (BlockTxInfo *info, BlockTxClientDoneCB cb)
+{
+    return 0;
+}
+
+void
+block_tx_client_run_command (BlockTxInfo *info, int command)
+{
+    return;
+}
+
+#endif

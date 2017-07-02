@@ -1,40 +1,8 @@
-MAKE_CLIENT =
+SUBDIRS = include lib common daemon app doc python
 
-if COMPILE_CLIENT
-  MAKE_CLIENT += daemon
-endif
+DIST_SUBDIRS = include lib common app daemon doc python
 
-if WIN32
-  MAKE_CONTROLLER =
-else
-  MAKE_CONTROLLER = controller
-endif
-
-if COMPILE_FUSE
-  MAKE_FUSE = fuse
-else
-  MAKE_FUSE =
-endif
-
-if COMPILE_SERVER
-  MAKE_SERVER = server tools fileserver $(MAKE_CONTROLLER) $(MAKE_FUSE)
-endif
-
-SUBDIRS = include lib common app python tests doc \
-	$(MAKE_CLIENT) $(MAKE_SERVER)
-
-DIST_SUBDIRS = include lib common app python tests \
-	daemon server tools fileserver controller \
-	doc fuse
-
-INTLTOOL = \
-	intltool-extract.in \
-	intltool-merge.in \
-	intltool-update.in
-
-EXTRA_DIST = install-sh $(INTLTOOL) README.markdown scripts debian msi LICENSE.txt
-
-DISTCHECK_CONFIGURE_FLAGS = --enable-server
+EXTRA_DIST = install-sh $(INTLTOOL) README.markdown scripts debian msi LICENSE.txt dmg
 
 ACLOCAL_AMFLAGS = -I m4
 

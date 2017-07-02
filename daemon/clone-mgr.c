@@ -1,3 +1,5 @@
+/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+
 #include "common.h"
 
 #include <ccnet.h>
@@ -11,19 +13,24 @@
 #include "merge-recursive.h"
 #include "unpack-trees.h"
 #include "vc-utils.h"
-
 #include "utils.h"
+#include "seafile-config.h"
 
 #include "processors/checkff-proc.h"
 
 #define CLONE_DB "clone.db"
 
-#define CHECK_CONNECT_INTERVAL 5 /* 5s */
+#define CHECK_CONNECT_INTERVAL 5
 
 static void
 on_repo_fetched (SeafileSession *seaf,
                  TransferTask *tx_task,
                  SeafCloneManager *mgr);
+
+static void
+on_repo_http_fetched (SeafileSession *seaf,
+                      HttpTxTask *tx_task,
+                      SeafCloneManager *mgr);
 
 static void
 on_checkout_done (CheckoutTask *task, SeafRepo *repo, void *data);
@@ -48,21 +55,23 @@ add_transfer_task (CloneTask *task, GError **error);
 
 static const char *state_str[] = {
     "init",
-    "connect",
-    "connect",                  /* Use "connect" for CHECK_PROTOCOL */
-    "index",
+    "check server",
     "fetch",
-    "checkout",
-    "merge",
     "done",
     "error",
     "canceling",
     "canceled",
+    /* States only used by old protocol. */
+    "connect",
+    "connect",                  /* Use "connect" for CHECK_PROTOCOL */
+    "index",
+    "checkout",
+    "merge",
 };
 
 static const char *error_str[] = {
     "ok",
-    "connect",
+    "check server",
     "index",
     "fetch",
     "password",
@@ -111,7 +120,14 @@ mark_clone_done_v2 (SeafRepo *repo, CloneTask *task)
         }
     }
 
-    if (repo->auto_sync) {
+    if (task->is_readonly) {
+        seaf_repo_set_readonly (repo);
+    }
+
+    if (task->server_url)
+        repo->server_url = g_strdup(task->server_url);
+
+    if (repo->auto_sync && (repo->sync_interval == 0)) {
         if (seaf_wt_monitor_watch_repo (seaf->wt_monitor,
                                         repo->id, repo->worktree) < 0) {
             seaf_warning ("failed to watch repo %s(%.10s).\n", repo->name, repo->id);
@@ -154,6 +170,13 @@ start_clone_v2 (CloneTask *task)
         seaf_repo_manager_set_repo_email (seaf->repo_mgr, repo, task->email);
         seaf_repo_manager_set_repo_relay_info (seaf->repo_mgr, repo->id,
                                                task->peer_addr, task->peer_port);
+        seaf_repo_manager_set_repo_relay_id (seaf->repo_mgr, repo, task->peer_id);
+        if (task->server_url) {
+            seaf_repo_manager_set_repo_property (seaf->repo_mgr,
+                                                 repo->id,
+                                                 REPO_PROP_SERVER_URL,
+                                                 task->server_url);
+        }
 
         mark_clone_done_v2 (repo, task);
         return;
@@ -212,6 +235,174 @@ start_check_protocol_proc (const char *peer_id, CloneTask *task)
     return 0;
 }
 
+static void
+start_connect_task_relay (CloneTask *task, GError **error)
+{
+    CcnetPeer *peer = ccnet_get_peer (seaf->ccnetrpc_client, task->peer_id);
+    if (!peer) {
+        /* clone from a new relay */
+        GString *buf = NULL; 
+        seaf_message ("add relay before clone, %s:%s\n",
+                      task->peer_addr, task->peer_port);
+        buf = g_string_new(NULL);
+        g_string_append_printf (buf, "add-relay --id %s --addr %s:%s",
+                                task->peer_id, task->peer_addr, task->peer_port);
+        ccnet_send_command (seaf->session, buf->str, NULL, NULL);
+        transition_state (task, CLONE_STATE_CONNECT);
+        g_string_free (buf, TRUE);
+    } else {
+        /* The peer is added to ccnet already and will be connected,
+         * only need to transition the state
+         */
+        transition_state (task, CLONE_STATE_CONNECT);
+    }
+
+    if (peer)
+        g_object_unref (peer);
+}
+
+static void
+connect_non_http_server (CloneTask *task)
+{
+    if (!ccnet_peer_is_ready (seaf->ccnetrpc_client, task->peer_id))
+        start_connect_task_relay (task, NULL);
+    else
+        start_check_protocol_proc (task->peer_id, task);
+}
+
+static void
+check_head_commit_done (HttpHeadCommit *result, void *user_data)
+{
+    CloneTask *task = user_data;
+
+    if (task->state == CLONE_STATE_CANCEL_PENDING) {
+        transition_state (task, CLONE_STATE_CANCELED);
+        return;
+    }
+
+    if (result->check_success && !result->is_corrupt && !result->is_deleted) {
+        memcpy (task->server_head_id, result->head_commit, 40);
+        start_clone_v2 (task);
+    } else {
+        transition_to_error (task, CLONE_ERROR_CHECK_SERVER);
+        if (result->error_code != 0)
+            task->err_detail = g_strdup(http_task_error_str(result->error_code));
+    }
+}
+
+static void
+http_check_head_commit (CloneTask *task)
+{
+    int ret = http_tx_manager_check_head_commit (seaf->http_tx_mgr,
+                                                 task->repo_id,
+                                                 task->repo_version,
+                                                 task->effective_url,
+                                                 task->token,
+                                                 task->use_fileserver_port,
+                                                 check_head_commit_done,
+                                                 task);
+    if (ret < 0)
+        transition_to_error (task, CLONE_ERROR_CHECK_SERVER);
+}
+
+static char *
+http_fileserver_url (const char *url)
+{
+    const char *host;
+    char *colon;
+    char *url_no_port;
+    char *ret = NULL;
+
+    /* Just return the url itself if it's invalid. */
+    if (strlen(url) <= strlen("http://"))
+        return g_strdup(url);
+
+    /* Skip protocol schem. */
+    host = url + strlen("http://");
+
+    colon = strrchr (host, ':');
+    if (colon) {
+        url_no_port = g_strndup(url, colon - url);
+        ret = g_strconcat(url_no_port, ":8082", NULL);
+        g_free (url_no_port);
+    } else {
+        ret = g_strconcat(url, ":8082", NULL);
+    }
+
+    return ret;
+}
+
+static void
+check_http_fileserver_protocol_done (HttpProtocolVersion *result, void *user_data)
+{
+    CloneTask *task = user_data;
+
+    if (task->state == CLONE_STATE_CANCEL_PENDING) {
+        transition_state (task, CLONE_STATE_CANCELED);
+        return;
+    }
+
+    if (result->check_success && !result->not_supported) {
+        task->http_protocol_version = result->version;
+        task->effective_url = http_fileserver_url (task->server_url);
+        task->use_fileserver_port = TRUE;
+        task->http_sync = TRUE;
+        http_check_head_commit (task);
+    } else {
+        /* Wait for periodic retry. */
+        transition_to_error (task, CLONE_ERROR_CHECK_SERVER);
+        if (result->error_code != 0)
+            task->err_detail = g_strdup(http_task_error_str(result->error_code));
+    }
+}
+
+static void
+check_http_protocol_done (HttpProtocolVersion *result, void *user_data)
+{
+    CloneTask *task = user_data;
+
+    if (task->state == CLONE_STATE_CANCEL_PENDING) {
+        transition_state (task, CLONE_STATE_CANCELED);
+        return;
+    }
+
+    if (result->check_success && !result->not_supported) {
+        task->http_protocol_version = result->version;
+        task->effective_url = g_strdup(task->server_url);
+        task->http_sync = TRUE;
+        http_check_head_commit (task);
+    } else if (strncmp(task->server_url, "https", 5) != 0) {
+        char *host_fileserver = http_fileserver_url(task->server_url);
+        if (http_tx_manager_check_protocol_version (seaf->http_tx_mgr,
+                                                    host_fileserver,
+                                                    TRUE,
+                                                    check_http_fileserver_protocol_done,
+                                                    task) < 0)
+            transition_to_error (task, CLONE_ERROR_CHECK_SERVER);
+        g_free (host_fileserver);
+    } else {
+        /* Wait for periodic retry. */
+        transition_to_error (task, CLONE_ERROR_CHECK_SERVER);
+        if (result->error_code != 0)
+            task->err_detail = g_strdup(http_task_error_str(result->error_code));
+    }
+}
+
+static void
+check_http_protocol (CloneTask *task)
+{
+    if (http_tx_manager_check_protocol_version (seaf->http_tx_mgr,
+                                                task->server_url,
+                                                FALSE,
+                                                check_http_protocol_done,
+                                                task) < 0) {
+        transition_to_error (task, CLONE_ERROR_CHECK_SERVER);
+        return;
+    }
+
+    transition_state (task, CLONE_STATE_CHECK_SERVER);
+}
+
 static CloneTask *
 clone_task_new (const char *repo_id,
                 const char *peer_id,
@@ -252,6 +443,9 @@ clone_task_free (CloneTask *task)
     g_free (task->peer_port);
     g_free (task->email);
     g_free (task->random_key);
+    g_free (task->server_url);
+    g_free (task->effective_url);
+    g_free (task->err_detail);
 
     g_free (task);
 }
@@ -350,6 +544,44 @@ load_clone_repo_version_info (CloneTask *task)
 }
 
 static gboolean
+load_more_info_cb (sqlite3_stmt *stmt, void *data)
+{
+    CloneTask *task = data;
+    json_error_t jerror;
+    json_t *object = NULL;
+    const char *more_info;
+
+    more_info = (const char *)sqlite3_column_text (stmt, 0);
+    object = json_loads (more_info, 0, &jerror);
+    if (!object) {
+        seaf_warning ("Failed to load more sync info from json: %s.\n", jerror.text);
+        return FALSE;
+    }
+        
+    json_t *integer = json_object_get (object, "is_readonly");
+    task->is_readonly = json_integer_value (integer);
+    json_t *string = json_object_get (object, "server_url");
+    if (string)
+        task->server_url = g_strdup (json_string_value (string));
+    json_decref (object);
+
+    return FALSE;
+}
+
+static void
+load_clone_more_info (CloneTask *task)
+{
+    char sql[256];
+
+    snprintf (sql, sizeof(sql),
+              "SELECT more_info FROM CloneTasksMoreInfo WHERE repo_id='%s'",
+              task->repo_id);
+
+    sqlite_foreach_selected_row (task->manager->db, sql,
+                                 load_more_info_cb, task);
+}
+
+static gboolean
 restart_task (sqlite3_stmt *stmt, void *data)
 {
     SeafCloneManager *mgr = data;
@@ -383,15 +615,25 @@ restart_task (sqlite3_stmt *stmt, void *data)
     task->repo_version = 0;
     load_clone_repo_version_info (task);
 
+    load_clone_more_info (task);
+
     repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
 
     if (repo != NULL && repo->head != NULL) {
         transition_state (task, CLONE_STATE_DONE);
         return TRUE;
-    } else if (!ccnet_peer_is_ready (seaf->ccnetrpc_client, task->peer_id))
-        start_connect_task_relay (task, NULL);
-    else
-        start_check_protocol_proc (task->peer_id, task);
+    }
+
+    if (task->repo_version > 0) {
+        if (task->server_url) {
+            check_http_protocol (task);
+        } else {
+            transition_to_error (task, CLONE_ERROR_CHECK_SERVER);
+            return TRUE;
+        }
+    } else {
+        connect_non_http_server (task);
+    }
 
     g_hash_table_insert (mgr->tasks, g_strdup(task->repo_id), task);
 
@@ -411,6 +653,11 @@ seaf_clone_manager_init (SeafCloneManager *mgr)
     if (sqlite_query_exec (mgr->db, sql) < 0)
         return -1;
 
+    sql = "CREATE TABLE IF NOT EXISTS CloneTasksMoreInfo "
+        "(repo_id TEXT PRIMARY KEY, more_info TEXT);";
+    if (sqlite_query_exec (mgr->db, sql) < 0)
+        return -1;
+
     sql = "CREATE TABLE IF NOT EXISTS CloneEncInfo "
         "(repo_id TEXT PRIMARY KEY, enc_version INTEGER, random_key TEXT);";
     if (sqlite_query_exec (mgr->db, sql) < 0)
@@ -418,6 +665,11 @@ seaf_clone_manager_init (SeafCloneManager *mgr)
 
     sql = "CREATE TABLE IF NOT EXISTS CloneVersionInfo "
         "(repo_id TEXT PRIMARY KEY, repo_version INTEGER);";
+    if (sqlite_query_exec (mgr->db, sql) < 0)
+        return -1;
+
+    sql = "CREATE TABLE IF NOT EXISTS CloneServerURL "
+        "(repo_id TEXT PRIMARY KEY, server_url TEXT);";
     if (sqlite_query_exec (mgr->db, sql) < 0)
         return -1;
 
@@ -441,7 +693,12 @@ static int check_connect_pulse (void *vmanager)
     g_hash_table_iter_init (&iter, mgr->tasks);
     while (g_hash_table_iter_next (&iter, &key, &value)) {
         task = value;
-        if (task->state == CLONE_STATE_CONNECT) {
+        if (task->state == CLONE_STATE_ERROR && task->repo_version > 0) {
+            g_free (task->err_detail);
+            task->err_detail = NULL;
+            task->error = 0;
+            check_http_protocol (task);
+        } else if (task->state == CLONE_STATE_CONNECT) {
             continue_task_when_peer_connected (task);
         }
     }
@@ -465,6 +722,8 @@ seaf_clone_manager_start (SeafCloneManager *mgr)
 
     g_signal_connect (seaf, "repo-fetched",
                       (GCallback)on_repo_fetched, mgr);
+    g_signal_connect (seaf, "repo-http-fetched",
+                      (GCallback)on_repo_http_fetched, mgr);
 
     return 0;
 }
@@ -515,6 +774,29 @@ save_task_to_db (SeafCloneManager *mgr, CloneTask *task)
     }
     sqlite3_free (sql);
 
+    if (task->is_readonly || task->server_url) {
+        /* need to store more info */
+        json_t *object = NULL;
+        gchar *info = NULL;
+
+        object = json_object ();
+        json_object_set_new (object, "is_readonly", json_integer (task->is_readonly));
+        if (task->server_url)
+            json_object_set_new (object, "server_url", json_string(task->server_url));
+    
+        info = json_dumps (object, 0);
+        json_decref (object);
+        sql = sqlite3_mprintf ("REPLACE INTO CloneTasksMoreInfo VALUES "
+                           "('%q', '%q')", task->repo_id, info);
+        if (sqlite_query_exec (mgr->db, sql) < 0) {
+            sqlite3_free (sql);
+            g_free (info);
+            return -1;
+        }
+        sqlite3_free (sql);
+        g_free (info);
+    }
+
     return 0;
 }
 
@@ -541,6 +823,12 @@ remove_task_from_db (SeafCloneManager *mgr, const char *repo_id)
     if (sqlite_query_exec (mgr->db, sql) < 0)
         return -1;
 
+    snprintf (sql, sizeof(sql), 
+              "DELETE FROM CloneTasksMoreInfo WHERE repo_id='%s'",
+              repo_id);
+    if (sqlite_query_exec (mgr->db, sql) < 0)
+        return -1;
+
     return 0;
 }
 
@@ -552,7 +840,6 @@ transition_state (CloneTask *task, int new_state)
                   state_str[task->state], state_str[new_state]);
 
     if (new_state == CLONE_STATE_DONE ||
-        new_state == CLONE_STATE_ERROR ||
         new_state == CLONE_STATE_CANCELED) {
         /* Remove from db but leave in memory. */
         remove_task_from_db (task->manager, task->repo_id);
@@ -569,9 +856,6 @@ transition_to_error (CloneTask *task, int error)
                   state_str[task->state], 
                   error_str[error]);
 
-    /* Remove from db but leave in memory. */
-    remove_task_from_db (task->manager, task->repo_id);
-
     task->state = CLONE_STATE_ERROR;
     task->error = error;
 }
@@ -579,19 +863,40 @@ transition_to_error (CloneTask *task, int error)
 static int
 add_transfer_task (CloneTask *task, GError **error)
 {
-    task->tx_id = seaf_transfer_manager_add_download (seaf->transfer_mgr,
-                                                      task->repo_id,
-                                                      task->repo_version,
-                                                      task->peer_id,
-                                                      "fetch_head",
-                                                      "master",
-                                                      task->token,
-                                                      task->server_side_merge,
-                                                      task->passwd,
-                                                      task->worktree,
-                                                      error);
-    if (!task->tx_id)
-        return -1;
+    if (!task->http_sync) {
+        task->tx_id = seaf_transfer_manager_add_download (seaf->transfer_mgr,
+                                                          task->repo_id,
+                                                          task->repo_version,
+                                                          task->peer_id,
+                                                          "fetch_head",
+                                                          "master",
+                                                          task->token,
+                                                          task->server_side_merge,
+                                                          task->passwd,
+                                                          task->worktree,
+                                                          task->email,
+                                                          error);
+        if (!task->tx_id)
+            return -1;
+    } else {
+        int ret = http_tx_manager_add_download (seaf->http_tx_mgr,
+                                                task->repo_id,
+                                                task->repo_version,
+                                                task->effective_url,
+                                                task->token,
+                                                task->server_head_id,
+                                                TRUE,
+                                                task->passwd,
+                                                task->worktree,
+                                                task->http_protocol_version,
+                                                task->email,
+                                                task->use_fileserver_port,
+                                                task->repo_name,
+                                                error);
+        if (ret < 0)
+            return -1;
+        task->tx_id = g_strdup(task->repo_id);
+    }
 
     return 0;
 }
@@ -646,6 +951,8 @@ out:
     return;
 }
 
+#ifndef WIN32
+
 static gboolean
 is_non_empty_directory (const char *path)
 {
@@ -661,6 +968,32 @@ is_non_empty_directory (const char *path)
 
     return ret;
 }
+
+#else
+
+static int
+check_empty_cb (wchar_t *parent, WIN32_FIND_DATAW *fdata, void *user_data, gboolean *stop)
+{
+    gboolean *res = user_data;
+
+    *res = TRUE;
+    *stop = TRUE;
+
+    return 0;
+}
+
+static gboolean
+is_non_empty_directory (const char *path)
+{
+    wchar_t *wpath = win32_long_path (path);
+    gboolean ret = FALSE;
+
+    traverse_directory_win32 (wpath, check_empty_cb, &ret);
+
+    return ret;
+}
+
+#endif  /* WIN32 */
 
 static int
 start_index_or_transfer (SeafCloneManager *mgr, CloneTask *task, GError **error)
@@ -689,39 +1022,12 @@ start_index_or_transfer (SeafCloneManager *mgr, CloneTask *task, GError **error)
     return ret;
 }
 
-static void
-start_connect_task_relay (CloneTask *task, GError **error)
-{
-    CcnetPeer *peer = ccnet_get_peer (seaf->ccnetrpc_client, task->peer_id);
-    if (!peer) {
-        /* clone from a new relay */
-        GString *buf = NULL; 
-        seaf_message ("add relay before clone, %s:%s\n",
-                      task->peer_addr, task->peer_port);
-        buf = g_string_new(NULL);
-        g_string_append_printf (buf, "add-relay --id %s --addr %s:%s",
-                                task->peer_id, task->peer_addr, task->peer_port);
-        ccnet_send_command (seaf->session, buf->str, NULL, NULL);
-        transition_state (task, CLONE_STATE_CONNECT);
-        g_string_free (buf, TRUE);
-    } else {
-        /* The peer is added to ccnet already and will be connected,
-         * only need to transition the state
-         */
-        transition_state (task, CLONE_STATE_CONNECT);
-    }
-
-    if (peer)
-        g_object_unref (peer);
-}
-
 static gboolean
 is_duplicate_task (SeafCloneManager *mgr, const char *repo_id)
 {
     CloneTask *task = g_hash_table_lookup (mgr->tasks, repo_id);
     if (task != NULL &&
         task->state != CLONE_STATE_DONE &&
-        task->state != CLONE_STATE_ERROR &&
         task->state != CLONE_STATE_CANCELED)
         return TRUE;
     return FALSE;
@@ -750,7 +1056,6 @@ is_worktree_of_repo (SeafCloneManager *mgr, const char *path)
     while (g_hash_table_iter_next (&iter, &key, &value)) {
         task = value;
         if (task->state == CLONE_STATE_DONE ||
-            task->state == CLONE_STATE_ERROR ||
             task->state == CLONE_STATE_CANCELED)
             continue;
         if (g_strcmp0 (path, task->worktree) == 0)
@@ -808,10 +1113,10 @@ make_worktree (SeafCloneManager *mgr,
     remove_trail_slash (wt);
 
     rc = seaf_stat (wt, &st);
-    if (rc < 0 && errno == ENOENT) {
+    if (rc < 0) {
         ret = wt;
         return ret;
-    } else if (rc < 0 || !S_ISDIR(st.st_mode)) {
+    } else if (!S_ISDIR(st.st_mode)) {
         if (!dry_run) {
             g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
                          "Invalid local directory");
@@ -956,7 +1261,6 @@ seaf_clone_manager_check_worktree_path (SeafCloneManager *mgr, const char *path,
     while (g_hash_table_iter_next (&iter, &key, &value)) {
         task = value;
         if (task->state == CLONE_STATE_DONE ||
-            task->state == CLONE_STATE_ERROR ||
             task->state == CLONE_STATE_CANCELED)
             continue;
         if (check_dir_inclusiveness (path, task->worktree) != 0) {
@@ -972,8 +1276,19 @@ seaf_clone_manager_check_worktree_path (SeafCloneManager *mgr, const char *path,
 }
 
 static char *
+canonical_server_url (const char *url_in)
+{
+    char *url = g_strdup(url_in);
+    int len = strlen(url);
+
+    if (url[len - 1] == '/')
+        url[len - 1] = 0;
+
+    return url;
+}
+
+static char *
 add_task_common (SeafCloneManager *mgr, 
-                 SeafRepo *repo,
                  const char *repo_id,
                  int repo_version,
                  const char *peer_id,
@@ -986,9 +1301,10 @@ add_task_common (SeafCloneManager *mgr,
                  const char *peer_addr,
                  const char *peer_port,
                  const char *email,
+                 const char *more_info,
                  GError **error)
 {
-    CloneTask *task;    
+    CloneTask *task;
 
     task = clone_task_new (repo_id, peer_id, repo_name,
                            token, worktree, passwd,
@@ -997,6 +1313,24 @@ add_task_common (SeafCloneManager *mgr,
     task->enc_version = enc_version;
     task->random_key = g_strdup (random_key);
     task->repo_version = repo_version;
+    if (more_info) {
+        json_error_t jerror;
+        json_t *object = NULL;
+
+        object = json_loads (more_info, 0, &jerror);
+        if (!object) {
+            seaf_warning ("Failed to load more sync info from json: %s.\n", jerror.text);
+            clone_task_free (task);
+            return NULL;
+        }
+        
+        json_t *integer = json_object_get (object, "is_readonly");
+        task->is_readonly = json_integer_value (integer);
+        json_t *string = json_object_get (object, "server_url");
+        if (string)
+            task->server_url = canonical_server_url (json_string_value (string));
+        json_decref (object);
+    }
 
     if (save_task_to_db (mgr, task) < 0) {
         seaf_warning ("[Clone mgr] failed to save task.\n");
@@ -1004,13 +1338,16 @@ add_task_common (SeafCloneManager *mgr,
         return NULL;
     }
 
-    if (!ccnet_peer_is_ready(seaf->ccnetrpc_client, task->peer_id)) {
-        /* the relay is not connected yet.
-         * We need relay connected even before checkout.
-         */
-        start_connect_task_relay (task, error);
-    } else
-        start_check_protocol_proc (task->peer_id, task);
+    if (task->repo_version > 0) {
+        if (task->server_url) {
+            check_http_protocol (task);
+        } else {
+            clone_task_free (task);
+            return NULL;
+        }
+    } else {
+        connect_non_http_server (task);
+    }
 
     /* The old task for this repo will be freed. */
     g_hash_table_insert (mgr->tasks, g_strdup(task->repo_id), task);
@@ -1060,6 +1397,7 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
                              const char *peer_addr,
                              const char *peer_port,
                              const char *email,
+                             const char *more_info,
                              GError **error)
 {
     SeafRepo *repo;
@@ -1070,6 +1408,15 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
         seaf_message ("System not started, skip adding clone task.\n");
         return NULL;
     }
+
+#ifdef USE_GPL_CRYPTO
+    if (repo_version == 0 || (passwd && enc_version < 2)) {
+        seaf_warning ("Don't support syncing old version libraries.\n");
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Don't support syncing old version libraries");
+        return NULL;
+    }
+#endif
 
     if (passwd &&
         !check_encryption_args (magic, enc_version, random_key, error))
@@ -1130,10 +1477,12 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
     if (!repo)
         seaf_repo_manager_remove_repo_ondisk (seaf->repo_mgr, repo_id, FALSE);
 
-    ret = add_task_common (mgr, repo, repo_id, repo_version,
+    ret = add_task_common (mgr, repo_id, repo_version,
                            peer_id, repo_name, token, passwd,
                            enc_version, random_key,
-                           worktree, peer_addr, peer_port, email, error);
+                           worktree, peer_addr, peer_port,
+                           email, more_info,
+                           error);
     g_free (worktree);
 
     return ret;
@@ -1175,6 +1524,7 @@ seaf_clone_manager_add_download_task (SeafCloneManager *mgr,
                                       const char *peer_addr,
                                       const char *peer_port,
                                       const char *email,
+                                      const char *more_info,
                                       GError **error)
 {
     SeafRepo *repo;
@@ -1185,6 +1535,15 @@ seaf_clone_manager_add_download_task (SeafCloneManager *mgr,
         seaf_message ("System not started, skip adding clone task.\n");
         return NULL;
     }
+
+#ifdef USE_GPL_CRYPTO
+    if (repo_version == 0 || (passwd && enc_version < 2)) {
+        seaf_warning ("Don't support syncing old version libraries.\n");
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Don't support syncing old version libraries");
+        return NULL;
+    }
+#endif
 
     if (passwd &&
         !check_encryption_args (magic, enc_version, random_key, error))
@@ -1208,7 +1567,7 @@ seaf_clone_manager_add_download_task (SeafCloneManager *mgr,
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
                      "Repo already exists");
         return NULL;
-    }   
+    }
 
     if (is_duplicate_task (mgr, repo_id)) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL, 
@@ -1242,10 +1601,11 @@ seaf_clone_manager_add_download_task (SeafCloneManager *mgr,
     if (!repo)
         seaf_repo_manager_remove_repo_ondisk (seaf->repo_mgr, repo_id, FALSE);
 
-    ret = add_task_common (mgr, repo, repo_id, repo_version,
+    ret = add_task_common (mgr, repo_id, repo_version,
                            peer_id, repo_name, token, passwd,
                            enc_version, random_key,
-                           worktree, peer_addr, peer_port, email, error);
+                           worktree, peer_addr, peer_port,
+                           email, more_info, error);
     g_free (worktree);
     g_free (wt_tmp);
 
@@ -1270,17 +1630,26 @@ seaf_clone_manager_cancel_task (SeafCloneManager *mgr,
     switch (task->state) {
     case CLONE_STATE_INIT:
     case CLONE_STATE_CONNECT:
+    case CLONE_STATE_ERROR:
         transition_state (task, CLONE_STATE_CANCELED);
         break;
+    case CLONE_STATE_CHECK_SERVER:
+        transition_state (task, CLONE_STATE_CANCEL_PENDING);
     case CLONE_STATE_FETCH:
-        seaf_transfer_manager_cancel_task (seaf->transfer_mgr,
-                                           task->tx_id,
-                                           TASK_TYPE_DOWNLOAD);
+        if (!task->http_sync)
+            seaf_transfer_manager_cancel_task (seaf->transfer_mgr,
+                                               task->tx_id,
+                                               TASK_TYPE_DOWNLOAD);
+        else
+            http_tx_manager_cancel_task (seaf->http_tx_mgr,
+                                         task->repo_id,
+                                         HTTP_TASK_TYPE_DOWNLOAD);
         transition_state (task, CLONE_STATE_CANCEL_PENDING);
         break;
     case CLONE_STATE_INDEX:
     case CLONE_STATE_CHECKOUT:
     case CLONE_STATE_MERGE:
+    case CLONE_STATE_CHECK_PROTOCOL:
         /* We cannot cancel an in-progress checkout, just
          * wait until it finishes.
          */
@@ -1312,7 +1681,6 @@ seaf_clone_manager_remove_task (SeafCloneManager *mgr,
         return -1;
 
     if (task->state != CLONE_STATE_DONE &&
-        task->state != CLONE_STATE_ERROR &&
         task->state != CLONE_STATE_CANCELED) {
         seaf_warning ("[Clone mgr] cannot remove running task.\n");
         return -1;
@@ -1857,7 +2225,7 @@ start_checkout (SeafRepo *repo, CloneTask *task)
                                              repo->id, repo->version,
                                              local->commit_id);
     if (!commit) {
-        seaf_warning ("Failed to get commit %.8s.\n", local->commit_id);
+        seaf_warning ("Failed to get commit %s:%.8s.\n", repo->id, local->commit_id);
         transition_to_error (task, CLONE_ERROR_CHECKOUT);
         return;
     }
@@ -1908,6 +2276,9 @@ start_checkout (SeafRepo *repo, CloneTask *task)
 }
 
 static void
+check_folder_permissions (CloneTask *task);
+
+static void
 on_repo_fetched (SeafileSession *seaf,
                  TransferTask *tx_task,
                  SeafCloneManager *mgr)
@@ -1926,7 +2297,12 @@ on_repo_fetched (SeafileSession *seaf,
         transition_state (task, CLONE_STATE_CANCELED);
         return;
     } else if (tx_task->state == TASK_STATE_ERROR) {
-        transition_to_error (task, CLONE_ERROR_FETCH);
+        /* transition_to_error (task, CLONE_ERROR_FETCH); */
+        /* Always restart failed clone task. */
+        if (add_transfer_task (task, NULL) == 0)
+            transition_state (task, CLONE_STATE_FETCH);
+        else
+            transition_to_error (task, CLONE_ERROR_FETCH);
         return;
     }
 
@@ -1943,11 +2319,66 @@ on_repo_fetched (SeafileSession *seaf,
     seaf_repo_manager_set_repo_email (seaf->repo_mgr, repo, task->email);
     seaf_repo_manager_set_repo_relay_info (seaf->repo_mgr, repo->id,
                                            task->peer_addr, task->peer_port);
+    seaf_repo_manager_set_repo_relay_id (seaf->repo_mgr, repo, task->peer_id);
+    if (task->server_url) {
+        seaf_repo_manager_set_repo_property (seaf->repo_mgr,
+                                             repo->id,
+                                             REPO_PROP_SERVER_URL,
+                                             task->server_url);
+    }
 
     if (!task->server_side_merge)
         start_checkout (repo, task);
     else
-        mark_clone_done_v2 (repo, task);
+        check_folder_permissions (task);
+}
+
+static void
+on_repo_http_fetched (SeafileSession *seaf,
+                      HttpTxTask *tx_task,
+                      SeafCloneManager *mgr)
+{
+    CloneTask *task;
+
+    /* Only handle clone task. */
+    if (!tx_task->is_clone)
+        return;
+
+    task = g_hash_table_lookup (mgr->tasks, tx_task->repo_id);
+    g_return_if_fail (task != NULL);
+
+    if (tx_task->state == HTTP_TASK_STATE_CANCELED) {
+        /* g_assert (task->state == CLONE_STATE_CANCEL_PENDING); */
+        transition_state (task, CLONE_STATE_CANCELED);
+        return;
+    } else if (tx_task->state == HTTP_TASK_STATE_ERROR) {
+        transition_to_error (task, CLONE_ERROR_FETCH);
+        task->err_detail = g_strdup(http_task_error_str(tx_task->error));
+        return;
+    }
+
+    SeafRepo *repo = seaf_repo_manager_get_repo (seaf->repo_mgr,
+                                                 tx_task->repo_id);
+    if (repo == NULL) {
+        seaf_warning ("[Clone mgr] cannot find repo %s after fetched.\n", 
+                   tx_task->repo_id);
+        transition_to_error (task, CLONE_ERROR_INTERNAL);
+        return;
+    }
+
+    seaf_repo_manager_set_repo_token (seaf->repo_mgr, repo, task->token);
+    seaf_repo_manager_set_repo_email (seaf->repo_mgr, repo, task->email);
+    seaf_repo_manager_set_repo_relay_info (seaf->repo_mgr, repo->id,
+                                           task->peer_addr, task->peer_port);
+    seaf_repo_manager_set_repo_relay_id (seaf->repo_mgr, repo, task->peer_id);
+    if (task->server_url) {
+        seaf_repo_manager_set_repo_property (seaf->repo_mgr,
+                                             repo->id,
+                                             REPO_PROP_SERVER_URL,
+                                             task->server_url);
+    }
+
+    check_folder_permissions (task);
 }
 
 static void
@@ -1976,4 +2407,79 @@ on_checkout_done (CheckoutTask *ctask, SeafRepo *repo, void *data)
                                              repo->head->commit_id);
         transition_state (task, CLONE_STATE_DONE);
     }
+}
+
+static void
+check_folder_perms_done (HttpFolderPerms *result, void *user_data)
+{
+    CloneTask *task = user_data;
+    GList *ptr;
+    HttpFolderPermRes *res;
+
+    SeafRepo *repo = seaf_repo_manager_get_repo (seaf->repo_mgr,
+                                                 task->repo_id);
+    if (repo == NULL) {
+        seaf_warning ("[Clone mgr] cannot find repo %s after fetched.\n", 
+                   task->repo_id);
+        transition_to_error (task, CLONE_ERROR_INTERNAL);
+        return;
+    }
+
+    if (!result->success) {
+        goto out;
+    }
+
+    for (ptr = result->results; ptr; ptr = ptr->next) {
+        res = ptr->data;
+
+        seaf_repo_manager_update_folder_perms (seaf->repo_mgr, res->repo_id,
+                                               FOLDER_PERM_TYPE_USER,
+                                               res->user_perms);
+        seaf_repo_manager_update_folder_perms (seaf->repo_mgr, res->repo_id,
+                                               FOLDER_PERM_TYPE_GROUP,
+                                               res->group_perms);
+        seaf_repo_manager_update_folder_perm_timestamp (seaf->repo_mgr,
+                                                        res->repo_id,
+                                                        res->timestamp);
+    }
+
+out:
+    mark_clone_done_v2 (repo, task);
+}
+
+static void
+check_folder_permissions (CloneTask *task)
+{
+    SeafRepo *repo = NULL;
+    HttpFolderPermReq *req;
+    GList *requests = NULL;
+
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, task->repo_id);
+    if (repo == NULL) {
+        seaf_warning ("[Clone mgr] cannot find repo %s after fetched.\n", 
+                      task->repo_id);
+        transition_to_error (task, CLONE_ERROR_INTERNAL);
+        return;
+    }
+
+    if (!seaf_repo_manager_server_is_pro (seaf->repo_mgr, task->server_url)) {
+        mark_clone_done_v2 (repo, task);
+        return;
+    }
+
+    req = g_new0 (HttpFolderPermReq, 1);
+    memcpy (req->repo_id, task->repo_id, 36);
+    req->token = g_strdup(task->token);
+    req->timestamp = 0;
+
+    requests = g_list_append (requests, req);
+
+    /* The requests list will be freed in http tx manager. */
+    if (http_tx_manager_get_folder_perms (seaf->http_tx_mgr,
+                                          task->effective_url,
+                                          task->use_fileserver_port,
+                                          requests,
+                                          check_folder_perms_done,
+                                          task) < 0)
+        transition_to_error (task, CLONE_ERROR_INTERNAL);
 }

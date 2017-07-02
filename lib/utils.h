@@ -3,6 +3,13 @@
 #ifndef CCNET_UTILS_H
 #define CCNET_UTILS_H
 
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x500
+#endif
+#include <windows.h>
+#endif
+
 #include <sys/time.h>
 #include <time.h>
 #include <stdint.h>
@@ -39,29 +46,11 @@
 #define ccnet_pipe_t intptr_t
 
 int pgpipe (ccnet_pipe_t handles[2]);
-#define ccnet_mkdir(a,b) g_mkdir((a),(b))
+/* Should only be called in main loop. */
 #define ccnet_pipe(a) pgpipe((a))
 #define piperead(a,b,c) recv((a),(b),(c),0)
 #define pipewrite(a,b,c) send((a),(b),(c),0)
 #define pipeclose(a) closesocket((a))
-
-static inline int ccnet_rename(const char *oldfile, const char *newfile)
-{
-    int ret = g_rename (oldfile, newfile);
-    if (ret < 0) {
-        if (errno != EEXIST) 
-            return -1;
-        
-        ret = g_unlink(oldfile);
-        
-        if (ret < 0) {
-            g_warning("ccnet_rename failed because g_unlink failed\n");
-            return -1;
-        }
-        return g_rename(oldfile, newfile);
-    }
-    return 0;
-}
 
 #define SeafStat struct __stat64
 
@@ -69,12 +58,10 @@ static inline int ccnet_rename(const char *oldfile, const char *newfile)
 
 #define ccnet_pipe_t int
 
-#define ccnet_mkdir(a,b) g_mkdir((a),(b))
 #define ccnet_pipe(a) pipe((a))
 #define piperead(a,b,c) read((a),(b),(c))
 #define pipewrite(a,b,c) write((a),(b),(c))
 #define pipeclose(a) close((a))
-#define ccnet_rename g_rename
 
 #define SeafStat struct stat
 
@@ -86,7 +73,61 @@ static inline int ccnet_rename(const char *oldfile, const char *newfile)
 int seaf_stat (const char *path, SeafStat *st);
 int seaf_fstat (int fd, SeafStat *st);
 
+#ifdef WIN32
+void
+seaf_stat_from_find_data (WIN32_FIND_DATAW *fdata, SeafStat *st);
+#endif
+
 int seaf_set_file_time (const char *path, guint64 mtime);
+
+#ifdef WIN32
+wchar_t *
+win32_long_path (const char *path);
+
+/* Convert a (possible) 8.3 format path to long path */
+wchar_t *
+win32_83_path_to_long_path (const char *worktree, const wchar_t *path, int path_len);
+
+__time64_t
+file_time_to_unix_time (FILETIME *ftime);
+#endif
+
+int
+seaf_util_unlink (const char *path);
+
+int
+seaf_util_rmdir (const char *path);
+
+int
+seaf_util_mkdir (const char *path, mode_t mode);
+
+int
+seaf_util_open (const char *path, int flags);
+
+int
+seaf_util_create (const char *path, int flags, mode_t mode);
+
+int
+seaf_util_rename (const char *oldpath, const char *newpath);
+
+gboolean
+seaf_util_exists (const char *path);
+
+gint64
+seaf_util_lseek (int fd, gint64 offset, int whence);
+
+#ifdef WIN32
+
+typedef int (*DirentCallback) (wchar_t *parent,
+                               WIN32_FIND_DATAW *fdata,
+                               void *user_data,
+                               gboolean *stop);
+
+int
+traverse_directory_win32 (wchar_t *path_w,
+                          DirentCallback callback,
+                          void *user_data);
+#endif
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -128,6 +169,8 @@ char* gen_uuid ();
 void gen_uuid_inplace (char *buf);
 gboolean is_uuid_valid (const char *uuid_str);
 
+gboolean
+is_object_id_valid (const char *obj_id);
 
 /* dir operations */
 int checkdir (const char *dir);
@@ -192,28 +235,11 @@ void nfree_string_array (char **array, int n);
 /* 64bit time */
 gint64 get_current_time();
 
-int
-ccnet_encrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len);
-
-
-int
-ccnet_decrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len);
-
-
 /*
  * Utility functions for converting data to/from network byte order.
  */
 
+#if !defined(__NetBSD__)
 static inline uint64_t
 bswap64 (uint64_t val)
 {
@@ -231,6 +257,7 @@ bswap64 (uint64_t val)
 
     return ret;
 }
+#endif
 
 static inline uint64_t
 hton64(uint64_t val)
@@ -342,6 +369,9 @@ json_object_set_int_member (json_t *object, const char *key, gint64 value);
 void
 clean_utf8_data (char *data, int len);
 
+char *
+normalize_utf8_path (const char *path);
+
 /* zlib related functions. */
 
 int
@@ -349,5 +379,14 @@ seaf_compress (guint8 *input, int inlen, guint8 **output, int *outlen);
 
 int
 seaf_decompress (guint8 *input, int inlen, guint8 **output, int *outlen);
+
+char*
+format_dir_path (const char *path);
+
+gboolean
+is_empty_string (const char *str);
+
+gboolean
+is_permission_valid (const char *perm);
 
 #endif

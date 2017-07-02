@@ -292,7 +292,7 @@ static void make_room_for_directories_of_df_conflicts(struct merge_options *o,
             memcmp(e->path, last_file, last_len) == 0 &&
             e->path[last_len] == '/') {
             real_path = g_build_path(PATH_SEPERATOR, o->worktree, last_file, NULL);
-            g_unlink(real_path);
+            seaf_util_unlink(real_path);
             g_free (real_path);
         }
 
@@ -335,10 +335,7 @@ remove_path (const char *worktree, const char *name, guint64 mtime)
             return -1;
         }
 
-        if (g_unlink(path) && errno != ENOENT) {
-            g_free (path);
-            return -1;
-        }
+        seaf_util_unlink(path);
     } else if (S_ISDIR (st.st_mode)) {
         if (seaf_remove_empty_dir (path) < 0) {
             g_warning ("Failed to remove %s: %s.\n", path, strerror(errno));
@@ -384,38 +381,6 @@ static int remove_file(struct merge_options *o, int clean,
     return 0;
 }
 
-inline static int file_exists(const char *f)
-{
-    SeafStat sb;
-    return (seaf_stat (f, &sb) == 0);
-}
-
-#if 0
-static int would_lose_untracked(struct index_state *index, const char *path, const char *real_path)
-{
-    int pos = index_name_pos(index, path, strlen(path));
-
-    if (pos < 0)
-        pos = -1 - pos;
-    while (pos < index->cache_nr &&
-           !strcmp(path, index->cache[pos]->name)) {
-        /*
-         * If stage #0, it is definitely tracked.
-         * If it has stage #2 then it was tracked
-         * before this merge started.  All other
-         * cases the path was not tracked.
-         */
-        switch (ce_stage(index->cache[pos])) {
-        case 0:
-        case 2:
-            return 0;
-        }
-        pos++;
-    }
-    return file_exists(real_path);
-}
-#endif
-
 static int create_leading_directories(int base_len,
                                       const char *path, char **new_path,
                                       const char *conflict_suffix,
@@ -460,7 +425,7 @@ static int create_leading_directories(int base_len,
                 continue;
         }
         
-        if (ccnet_mkdir (buf, 0777) < 0) {
+        if (seaf_util_mkdir (buf, 0777) < 0) {
             g_warning ("Failed to create directory %s.\n", buf);
             return -1;
         }
@@ -485,7 +450,7 @@ static int make_room_for_path(struct index_state *index, const char *path,
     }
 
     if (seaf_stat (*new_path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        if (g_rmdir (*new_path) < 0) {
+        if (seaf_util_rmdir (*new_path) < 0) {
             g_warning ("failed to remove directory %s.\n", *new_path);
             /* Don't return error since we can handle conflict later. */
         }
@@ -554,7 +519,7 @@ static int update_file_flags(struct merge_options *o,
 
         /* Checkout an empty dir. */
         if (S_ISDIR (mode)) {
-            if (g_mkdir (real_path, 0777) < 0) {
+            if (seaf_util_mkdir (real_path, 0777) < 0) {
                 g_warning ("Failed to create empty dir %s in merge.\n", real_path);
                 refresh = 0;
             }
@@ -593,7 +558,8 @@ static int update_file_flags(struct merge_options *o,
                                           o->remote_head,
                                           path,
                                           FALSE,
-                                          &conflicted) < 0) {
+                                          &conflicted,
+                                          NULL) < 0) {
             g_warning("Failed to checkout file %s.\n", file_id);
             refresh = 0;
             goto update_cache;

@@ -12,7 +12,6 @@
     #include <arpa/inet.h>
 #endif
 
-#include <openssl/sha.h>
 #include <searpc-utils.h>
 
 #include "seafile-session.h"
@@ -21,6 +20,7 @@
 #include "block-mgr.h"
 #include "utils.h"
 #include "seaf-utils.h"
+#define DEBUG_FLAG SEAFILE_DEBUG_OTHER
 #include "log.h"
 #include "../common/seafile-crypt.h"
 
@@ -30,8 +30,6 @@
 #endif  /* SEAFILE_SERVER */
 
 #include "db.h"
-
-#define SEAF_TMP_EXT "~"
 
 struct _SeafFSManagerPriv {
     /* GHashTable      *seafile_cache; */
@@ -92,19 +90,19 @@ seaf_fs_manager_init (SeafFSManager *mgr)
 
 #ifdef FULL_FEATURE
     if (seaf_obj_store_init (mgr->obj_store, TRUE, seaf->ev_mgr) < 0) {
-        g_warning ("[fs mgr] Failed to init fs object store.\n");
+        seaf_warning ("[fs mgr] Failed to init fs object store.\n");
         return -1;
     }
 #else
     if (seaf_obj_store_init (mgr->obj_store, FALSE, NULL) < 0) {
-        g_warning ("[fs mgr] Failed to init fs object store.\n");
+        seaf_warning ("[fs mgr] Failed to init fs object store.\n");
         return -1;
     }
 #endif
 
 #else
     if (seaf_obj_store_init (mgr->obj_store, TRUE, seaf->ev_mgr) < 0) {
-        g_warning ("[fs mgr] Failed to init fs object store.\n");
+        seaf_warning ("[fs mgr] Failed to init fs object store.\n");
         return -1;
     }
 #endif
@@ -131,14 +129,14 @@ checkout_block (const char *repo_id,
                                             repo_id, version,
                                             block_id, BLOCK_READ);
     if (!handle) {
-        g_warning ("Failed to open block %s\n", block_id);
+        seaf_warning ("Failed to open block %s\n", block_id);
         return -1;
     }
 
     /* first stat the block to get its size */
     bmd = seaf_block_manager_stat_block_by_handle (block_mgr, handle);
     if (!bmd) {
-        g_warning ("can't stat block %s.\n", block_id);
+        seaf_warning ("can't stat block %s.\n", block_id);
         goto checkout_blk_error;
     }
 
@@ -154,7 +152,7 @@ checkout_block (const char *repo_id,
     /* read the block to prepare decryption */
     if (seaf_block_manager_read_block (block_mgr, handle,
                                        blk_content, bmd->size) != bmd->size) {
-        g_warning ("Error when reading from block %s.\n", block_id);
+        seaf_warning ("Error when reading from block %s.\n", block_id);
         goto checkout_blk_error;
     }
 
@@ -164,7 +162,7 @@ checkout_block (const char *repo_id,
            ENCRYPT_BLK_SIZE
         */
         if (bmd->size % ENCRYPT_BLK_SIZE != 0) {
-            g_warning ("Error: An invalid encrypted block, %s \n", block_id);
+            seaf_warning ("Error: An invalid encrypted block, %s \n", block_id);
             goto checkout_blk_error;
         }
 
@@ -176,7 +174,7 @@ checkout_block (const char *repo_id,
                                    crypt);
 
         if (ret != 0) {
-            g_warning ("Decryt block %s failed. \n", block_id);
+            seaf_warning ("Decryt block %s failed. \n", block_id);
             goto checkout_blk_error;
         }
 
@@ -185,7 +183,7 @@ checkout_block (const char *repo_id,
 
 
         if (ret !=  dec_out_len) {
-            g_warning ("Failed to write the decryted block %s.\n",
+            seaf_warning ("Failed to write the decryted block %s.\n",
                        block_id);
             goto checkout_blk_error;
         }
@@ -196,7 +194,7 @@ checkout_block (const char *repo_id,
     } else {
         /* not an encrypted block */
         if (writen(wfd, blk_content, bmd->size) != bmd->size) {
-            g_warning ("Failed to write the decryted block %s.\n",
+            seaf_warning ("Failed to write the decryted block %s.\n",
                        block_id);
             goto checkout_blk_error;
         }
@@ -222,6 +220,16 @@ checkout_blk_error:
     return -1;
 }
 
+#define SEAF_TMP_EXT "~"
+#define SEAF_BACKUP_EXT ".sbak"
+
+/*
+ * File updating procedure:
+ * 1. Checkout server versioin to tmp file.
+ * 2. If there is a local version, move it to a backup file.
+ * 3. Rename the tmp file to the destination path.
+ * 4. Remove the backup file if exists.
+ */
 int
 seaf_fs_manager_checkout_file (SeafFSManager *mgr,
                                const char *repo_id,
@@ -234,28 +242,34 @@ seaf_fs_manager_checkout_file (SeafFSManager *mgr,
                                const char *in_repo_path,
                                const char *conflict_head_id,
                                gboolean force_conflict,
-                               gboolean *conflicted)
+                               gboolean *conflicted,
+                               const char *email)
 {
-    Seafile *seafile;
+    Seafile *seafile = NULL;
     char *blk_id;
-    int wfd;
+    int wfd = -1;
     int i;
-    char *tmp_path;
-    char *conflict_path;
+    char *tmp_path = NULL;
+    char *backup_path = NULL;
+    char *conflict_path = NULL;
 
     *conflicted = FALSE;
 
+    /* Check out server version to tmp file. */
+
     seafile = seaf_fs_manager_get_seafile (mgr, repo_id, version, file_id);
     if (!seafile) {
-        g_warning ("File %s does not exist.\n", file_id);
+        seaf_warning ("File %s does not exist.\n", file_id);
         return -1;
     }
 
     tmp_path = g_strconcat (file_path, SEAF_TMP_EXT, NULL);
 
-    wfd = g_open (tmp_path, O_WRONLY | O_TRUNC | O_CREAT | O_BINARY, mode & ~S_IFMT);
+    mode_t rmode = mode & 0100 ? 0777 : 0666;
+    wfd = seaf_util_create (tmp_path, O_WRONLY | O_TRUNC | O_CREAT | O_BINARY,
+                            rmode & ~S_IFMT);
     if (wfd < 0) {
-        g_warning ("Failed to open file %s for checkout: %s.\n",
+        seaf_warning ("Failed to open file %s for checkout: %s.\n",
                    tmp_path, strerror(errno));
         goto bad;
     }
@@ -269,20 +283,95 @@ seaf_fs_manager_checkout_file (SeafFSManager *mgr,
     close (wfd);
     wfd = -1;
 
-    if (force_conflict || ccnet_rename (tmp_path, file_path) < 0) {
+    /* Move existing file to backup file. */
+
+    backup_path = g_strconcat (file_path, SEAF_BACKUP_EXT, NULL);
+
+    if (seaf_util_exists (file_path) &&
+        seaf_util_rename (file_path, backup_path) < 0) {
+        seaf_warning ("Failed to rename %s to %s: %s. "
+                      "Checkout server version as conflict file.\n",
+                      file_path, backup_path, strerror(errno));
+
         *conflicted = TRUE;
+
         conflict_path = gen_conflict_path_wrapper (repo_id, version,
                                                    conflict_head_id, in_repo_path,
                                                    file_path);
         if (!conflict_path)
             goto bad;
-        if (ccnet_rename (tmp_path, conflict_path) < 0) {
-            g_free (conflict_path);
+
+        if (seaf_util_rename (tmp_path, conflict_path) < 0) {
             goto bad;
         }
-        g_free (conflict_path);
-    } else if (mtime > 0) {
-        /* !force_conflict && ccnet_rename() == 0
+
+        goto out;
+    }
+
+    /* Now that the old existing file has been renamed to backup file,
+     * this rename operation usually succeeds.
+     */
+    if (seaf_util_rename (tmp_path, file_path) < 0) {
+        seaf_warning ("Failed to rename %s to %s: %s. "
+                      "Checkout server version as conflict file.\n",
+                      tmp_path, file_path, strerror(errno));
+
+        *conflicted = TRUE;
+
+        /* Restore the existing file. */
+        if (seaf_util_rename (backup_path, file_path) < 0) {
+            seaf_warning ("Failed to rename %s to %s: %s. "
+                          "Failed to restore backup file.\n",
+                          backup_path, file_path, strerror(errno));
+        }
+
+        conflict_path = gen_conflict_path_wrapper (repo_id, version,
+                                                   conflict_head_id, in_repo_path,
+                                                   file_path);
+        if (!conflict_path)
+            goto bad;
+
+        if (seaf_util_rename (tmp_path, conflict_path) < 0) {
+            goto bad;
+        }
+
+        goto out;
+    }
+
+    if (force_conflict) {
+        *conflicted = TRUE;
+
+        /* XXX
+         * In new syncing protocol and http sync, files are checked out before
+         * the repo is created. So we can't get user email from repo at this point.
+         * So a email parameter is needed.
+         * For old syncing protocol, repo always exists when files are checked out.
+         * This is a quick and dirty hack. A cleaner solution should modifiy the
+         * code of old syncing protocol to pass in email too. But I don't want to
+         * spend more time on the nearly obsoleted code.
+         */
+        const char *suffix = NULL;
+        if (email) {
+            suffix = email;
+        } else {
+            SeafRepo *repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+            if (!repo)
+                goto bad;
+            suffix = email;
+        }
+
+        conflict_path = gen_conflict_path (file_path, suffix, (gint64)time(NULL));
+
+        if (seaf_util_exists (backup_path) &&
+            seaf_util_rename (backup_path, conflict_path) < 0) {
+            seaf_warning ("Failed to rename %s to %s: %s. "
+                          "Failed to move backup file to conflict file.\n",
+                          backup_path, conflict_path, strerror(errno));
+        }
+    }
+
+    if (mtime > 0) {
+        /* 
          * Set the checked out file mtime to what it has to be.
          */
         if (seaf_set_file_time (file_path, mtime) < 0) {
@@ -290,7 +379,12 @@ seaf_fs_manager_checkout_file (SeafFSManager *mgr,
         }
     }
 
+    seaf_util_unlink (backup_path);
+
+out:
     g_free (tmp_path);
+    g_free (backup_path);
+    g_free (conflict_path);
     seafile_unref (seafile);
     return 0;
 
@@ -298,8 +392,10 @@ bad:
     if (wfd >= 0)
         close (wfd);
     /* Remove the tmp file if it still exists, in case that rename fails. */
-    g_unlink (tmp_path);
+    seaf_util_unlink (tmp_path);
     g_free (tmp_path);
+    g_free (backup_path);
+    g_free (conflict_path);
     seafile_unref (seafile);
     return -1;
 }
@@ -417,7 +513,8 @@ write_seafile (SeafFSManager *fs_mgr,
         int outlen;
 
         if (seaf_compress (ondisk, ondisk_size, &compressed, &outlen) < 0) {
-            seaf_warning ("Failed to compress seafile obj %s.\n", seafile_id);
+            seaf_warning ("Failed to compress seafile obj %s:%s.\n",
+                          repo_id, seafile_id);
             ret = -1;
             free (ondisk);
             goto out;
@@ -478,22 +575,26 @@ do_write_chunk (const char *repo_id, int version,
                                             repo_id, version,
                                             chksum_str, BLOCK_WRITE);
     if (!handle) {
-        g_warning ("Failed to open block %s.\n", chksum_str);
+        seaf_warning ("Failed to open block %s.\n", chksum_str);
         return -1;
     }
 
     n = seaf_block_manager_write_block (blk_mgr, handle, buf, len);
     if (n < 0) {
-        g_warning ("Failed to write chunk %s.\n", chksum_str);
+        seaf_warning ("Failed to write chunk %s.\n", chksum_str);
         seaf_block_manager_close_block (blk_mgr, handle);
         seaf_block_manager_block_handle_free (blk_mgr, handle);
         return -1;
     }
 
-    seaf_block_manager_close_block (blk_mgr, handle);
+    if (seaf_block_manager_close_block (blk_mgr, handle) < 0) {
+        seaf_warning ("failed to close block %s.\n", chksum_str);
+        seaf_block_manager_block_handle_free (blk_mgr, handle);
+        return -1;
+    }
 
     if (seaf_block_manager_commit_block (blk_mgr, handle) < 0) {
-        g_warning ("failed to commit chunk %s.\n", chksum_str);
+        seaf_warning ("failed to commit chunk %s.\n", chksum_str);
         seaf_block_manager_block_handle_free (blk_mgr, handle);
         return -1;
     }
@@ -511,7 +612,8 @@ seafile_write_chunk (const char *repo_id,
                      uint8_t *checksum,
                      gboolean write_data)
 {
-    SHA_CTX ctx;
+    GChecksum *ctx = g_checksum_new (G_CHECKSUM_SHA1);
+    gsize len = 20;
     int ret = 0;
 
     /* Encrypt before write to disk if needed, and we don't encrypt
@@ -526,26 +628,27 @@ seafile_write_chunk (const char *repo_id,
                                chunk->len,       /* input len */
                                crypt);
         if (ret != 0) {
-            g_warning ("Error: failed to encrypt block\n");
+            seaf_warning ("Error: failed to encrypt block\n");
+            g_checksum_free (ctx);
             return -1;
         }
 
-        SHA1_Init (&ctx);
-        SHA1_Update (&ctx, encrypted_buf, enc_len);
-        SHA1_Final (checksum, &ctx);
+        g_checksum_update (ctx, (unsigned char *)encrypted_buf, enc_len);
+        g_checksum_get_digest (ctx, checksum, &len);
 
         if (write_data)
             ret = do_write_chunk (repo_id, version, checksum, encrypted_buf, enc_len);
         g_free (encrypted_buf);
     } else {
         /* not a encrypted repo, go ahead */
-        SHA1_Init (&ctx);
-        SHA1_Update (&ctx, chunk->block_buf, chunk->len);
-        SHA1_Final (checksum, &ctx);
+        g_checksum_update (ctx, (unsigned char *)chunk->block_buf, chunk->len);
+        g_checksum_get_digest (ctx, checksum, &len);
 
         if (write_data)
             ret = do_write_chunk (repo_id, version, checksum, chunk->block_buf, chunk->len);
     }
+
+    g_checksum_free (ctx);
 
     return ret;
 }
@@ -564,13 +667,14 @@ seaf_fs_manager_index_blocks (SeafFSManager *mgr,
                               unsigned char sha1[],
                               gint64 *size,
                               SeafileCrypt *crypt,
-                              gboolean write_data)
+                              gboolean write_data,
+                              gboolean use_cdc)
 {
     SeafStat sb;
     CDCFileDescriptor cdc;
 
     if (seaf_stat (file_path, &sb) < 0) {
-        g_warning ("Bad file %s: %s.\n", file_path, strerror(errno));
+        seaf_warning ("Bad file %s: %s.\n", file_path, strerror(errno));
         return -1;
     }
 
@@ -582,19 +686,21 @@ seaf_fs_manager_index_blocks (SeafFSManager *mgr,
         create_cdc_for_empty_file (&cdc);
     } else {
         memset (&cdc, 0, sizeof(cdc));
-        cdc.block_sz = calculate_chunk_size (sb.st_size);
-        cdc.block_min_sz = cdc.block_sz >> 2;
-        cdc.block_max_sz = cdc.block_sz << 2;
+
+        cdc.block_sz = CDC_AVERAGE_BLOCK_SIZE;
+        cdc.block_min_sz = CDC_MIN_BLOCK_SIZE;
+        cdc.block_max_sz = CDC_MAX_BLOCK_SIZE;
         cdc.write_block = seafile_write_chunk;
         memcpy (cdc.repo_id, repo_id, 36);
         cdc.version = version;
         if (filename_chunk_cdc (file_path, &cdc, crypt, write_data) < 0) {
-            g_warning ("Failed to chunk file with CDC.\n");
+            seaf_warning ("Failed to chunk file with CDC.\n");
             return -1;
         }
 
         if (write_data && write_seafile (mgr, repo_id, version, &cdc, sha1) < 0) {
-            g_warning ("Failed to write seafile for %s.\n", file_path);
+            g_free (cdc.blk_sha1s);
+            seaf_warning ("Failed to write seafile for %s.\n", file_path);
             return -1;
         }
     }
@@ -605,142 +711,6 @@ seaf_fs_manager_index_blocks (SeafFSManager *mgr,
         free (cdc.blk_sha1s);
 
     return 0;
-}
-
-static int
-check_and_write_block (const char *repo_id, int version,
-                       const char *path, unsigned char *sha1, const char *block_id)
-{
-    char *content;
-    gsize len;
-    GError *error = NULL;
-    int ret = 0;
-
-    if (!g_file_get_contents (path, &content, &len, &error)) {
-        if (error) {
-            seaf_warning ("Failed to read %s: %s.\n", path, error->message);
-            g_clear_error (&error);
-            return -1;
-        }
-    }
-
-    SHA_CTX block_ctx;
-    unsigned char checksum[20];
-
-    SHA1_Init (&block_ctx);
-    SHA1_Update (&block_ctx, content, len);
-    SHA1_Final (checksum, &block_ctx);
-
-    if (memcmp (checksum, sha1, 20) != 0) {
-        seaf_warning ("Block id %s doesn't match content.\n", block_id);
-        ret = -1;
-        goto out;
-    }
-
-    if (do_write_chunk (repo_id, version, sha1, content, len) < 0) {
-        ret = -1;
-        goto out;
-    }
-
-out:
-    g_free (content);
-    return ret;
-}
-
-static int
-check_and_write_file_blocks (CDCFileDescriptor *cdc, GList *paths, GList *blockids)
-{
-    GList *ptr, *q;
-    SHA_CTX file_ctx;
-    int ret = 0;
-
-    SHA1_Init (&file_ctx);
-    for (ptr = paths, q = blockids; ptr; ptr = ptr->next, q = q->next) {
-        char *path = ptr->data;
-        char *blk_id = q->data;
-        unsigned char sha1[20];
-
-        hex_to_rawdata (blk_id, sha1, 20);
-        ret = check_and_write_block (cdc->repo_id, cdc->version, path, sha1, blk_id);
-        if (ret < 0)
-            goto out;
-
-        memcpy (cdc->blk_sha1s + cdc->block_nr * CHECKSUM_LENGTH,
-                sha1, CHECKSUM_LENGTH);
-        cdc->block_nr++;
-
-        SHA1_Update (&file_ctx, sha1, 20);
-    }
-
-    SHA1_Final (cdc->file_sum, &file_ctx);
-
-out:
-    return ret;
-}
-
-static int
-init_file_cdc (CDCFileDescriptor *cdc,
-               const char *repo_id, int version,
-               int block_nr, gint64 file_size)
-{
-    memset (cdc, 0, sizeof(CDCFileDescriptor));
-
-    cdc->file_size = file_size;
-
-    cdc->blk_sha1s =  (uint8_t *)calloc (sizeof(uint8_t), block_nr * CHECKSUM_LENGTH);
-    if (!cdc->blk_sha1s) {
-        seaf_warning ("Failed to alloc block sha1 array.\n");
-        return -1;
-    }
-
-    memcpy (cdc->repo_id, repo_id, 36);
-    cdc->version = version;
-
-    return 0;
-}
-
-int
-seaf_fs_manager_index_file_blocks (SeafFSManager *mgr,
-                                   const char *repo_id,
-                                   int version,
-                                   GList *paths,
-                                   GList *blockids,
-                                   unsigned char sha1[],
-                                   gint64 file_size)
-{
-    int ret = 0;
-    CDCFileDescriptor cdc;
-
-    if (!paths) {
-        /* handle empty file. */
-        memset (sha1, 0, 20);
-        create_cdc_for_empty_file (&cdc);
-    } else {
-        int block_nr = g_list_length (paths);
-
-        if (init_file_cdc (&cdc, repo_id, version, block_nr, file_size) < 0) {
-            ret = -1;
-            goto out;
-        }
-
-        if (check_and_write_file_blocks (&cdc, paths, blockids) < 0) {
-            seaf_warning ("Failed to check and write file blocks.\n");
-            ret = -1;
-            goto out;
-        }
-
-        if (write_seafile (mgr, repo_id, version, &cdc, sha1) < 0) {
-            seaf_warning ("Failed to write seafile.\n");
-            ret = -1;
-            goto out;
-        }
-    }
-
-out:
-    if (cdc.blk_sha1s)
-        free (cdc.blk_sha1s);
-
-    return ret;
 }
 
 void
@@ -781,18 +751,18 @@ seafile_from_v0_data (const char *id, const void *data, int len)
     int id_list_len, n_blocks;
 
     if (len < sizeof(SeafileOndisk)) {
-        g_warning ("[fs mgr] Corrupt seafile object %s.\n", id);
+        seaf_warning ("[fs mgr] Corrupt seafile object %s.\n", id);
         return NULL;
     }
 
     if (ntohl(ondisk->type) != SEAF_METADATA_TYPE_FILE) {
-        g_warning ("[fd mgr] %s is not a file.\n", id);
+        seaf_warning ("[fd mgr] %s is not a file.\n", id);
         return NULL;
     }
 
     id_list_len = len - sizeof(SeafileOndisk);
     if (id_list_len % 20 != 0) {
-        g_warning ("[fs mgr] Corrupt seafile object %s.\n", id);
+        seaf_warning ("[fs mgr] Corrupt seafile object %s.\n", id);
         return NULL;
     }
     n_blocks = id_list_len / 20;
@@ -831,14 +801,14 @@ seafile_from_json_object (const char *id, json_t *object)
     /* Sanity checks. */
     type = json_object_get_int_member (object, "type");
     if (type != SEAF_METADATA_TYPE_FILE) {
-        seaf_warning ("Object %s is not a file.\n", id);
+        seaf_debug ("Object %s is not a file.\n", id);
         return NULL;
     }
 
     version = (int) json_object_get_int_member (object, "version");
     if (version < 1) {
-        seaf_warning ("Seafile object %s version should be > 0, version is %d.\n",
-                      id, version);
+        seaf_debug ("Seafile object %s version should be > 0, version is %d.\n",
+                    id, version);
         return NULL;
     }
 
@@ -846,7 +816,7 @@ seafile_from_json_object (const char *id, json_t *object)
 
     block_id_array = json_object_get (object, "block_ids");
     if (!block_id_array) {
-        seaf_warning ("No block id array in seafile object %s.\n", id);
+        seaf_debug ("No block id array in seafile object %s.\n", id);
         return NULL;
     }
 
@@ -866,7 +836,7 @@ seafile_from_json_object (const char *id, json_t *object)
     for (i = 0; i < seafile->n_blocks; ++i) {
         block_id_obj = json_array_get (block_id_array, i);
         block_id = json_string_value (block_id_obj);
-        if (!block_id) {
+        if (!block_id || !is_object_id_valid(block_id)) {
             seafile_free (seafile);
             return NULL;
         }
@@ -895,10 +865,7 @@ seafile_from_json (const char *id, void *data, int len)
     object = json_loadb ((const char *)decompressed, outlen, 0, &error);
     g_free (decompressed);
     if (!object) {
-        if (error.text)
-            g_warning ("Failed to load seafile json object: %s.\n", error.text);
-        else
-            g_warning ("Failed to load seafile json object.\n");
+        seaf_warning ("Failed to load seafile json object: %s.\n", error.text);
         return NULL;
     }
 
@@ -944,7 +911,7 @@ seaf_fs_manager_get_seafile (SeafFSManager *mgr,
 
     if (seaf_obj_store_read_obj (mgr->obj_store, repo_id, version,
                                  file_id, &data, &len) < 0) {
-        g_warning ("[fs mgr] Failed to read file %s.\n", file_id);
+        seaf_warning ("[fs mgr] Failed to read file %s.\n", file_id);
         return NULL;
     }
 
@@ -1060,9 +1027,10 @@ seafile_save (SeafFSManager *fs_mgr,
 
 static void compute_dir_id_v0 (SeafDir *dir, GList *entries)
 {
-    SHA_CTX ctx;
+    GChecksum *ctx;
     GList *p;
     uint8_t sha1[20];
+    gsize len = 20;
     SeafDirent *dent;
     guint32 mode_le;
 
@@ -1072,19 +1040,19 @@ static void compute_dir_id_v0 (SeafDir *dir, GList *entries)
         return;
     }
 
-    SHA1_Init (&ctx);
+    ctx = g_checksum_new (G_CHECKSUM_SHA1);
     for (p = entries; p; p = p->next) {
         dent = (SeafDirent *)p->data;
-        SHA1_Update (&ctx, dent->id, 40);
-        SHA1_Update (&ctx, dent->name, dent->name_len);
+        g_checksum_update (ctx, (unsigned char *)dent->id, 40);
+        g_checksum_update (ctx, (unsigned char *)dent->name, dent->name_len);
         /* Convert mode to little endian before compute. */
         if (G_BYTE_ORDER == G_BIG_ENDIAN)
             mode_le = GUINT32_SWAP_LE_BE (dent->mode);
         else
             mode_le = dent->mode;
-        SHA1_Update (&ctx, &mode_le, sizeof(mode_le));
+        g_checksum_update (ctx, (unsigned char *)&mode_le, sizeof(mode_le));
     }
-    SHA1_Final (sha1, &ctx);
+    g_checksum_get_digest (ctx, sha1, &len);
 
     rawdata_to_hex (sha1, dir->dir_id, 20);
 }
@@ -1140,7 +1108,13 @@ seaf_dirent_new (int version, const char *sha1, int mode, const char *name,
     dent->version = version;
     memcpy(dent->id, sha1, 40);
     dent->id[40] = '\0';
-    dent->mode = mode;
+    /* Mode for files must have 0644 set. To prevent the caller from forgetting,
+     * we set the bits here.
+     */
+    if (S_ISREG(mode))
+        dent->mode = (mode | 0644);
+    else
+        dent->mode = mode;
     dent->name = g_strdup(name);
     dent->name_len = strlen(name);
 
@@ -1194,7 +1168,7 @@ seaf_dir_from_v0_data (const char *dir_id, const uint8_t *data, int len)
     meta_type = get32bit (&ptr);
     remain -= 4;
     if (meta_type != SEAF_METADATA_TYPE_DIR) {
-        g_warning ("Data does not contain a directory.\n");
+        seaf_warning ("Data does not contain a directory.\n");
         return NULL;
     }
 
@@ -1221,7 +1195,7 @@ seaf_dir_from_v0_data (const char *dir_id, const uint8_t *data, int len)
             ptr += dent->name_len;
             remain -= dent->name_len;
         } else {
-            g_warning ("Bad data format for dir objcet %s.\n", dir_id);
+            seaf_warning ("Bad data format for dir objcet %s.\n", dir_id);
             g_free (dent);
             goto bad;
         }
@@ -1252,13 +1226,17 @@ parse_dirent (const char *dir_id, int version, json_t *object)
 
     id = json_object_get_string_member (object, "id");
     if (!id) {
-        seaf_warning ("Dirent id not set for dir object %s.\n", dir_id);
+        seaf_debug ("Dirent id not set for dir object %s.\n", dir_id);
+        return NULL;
+    }
+    if (!is_object_id_valid (id)) {
+        seaf_debug ("Dirent id is invalid for dir object %s.\n", dir_id);
         return NULL;
     }
 
     name = json_object_get_string_member (object, "name");
     if (!name) {
-        seaf_warning ("Dirent name not set for dir object %s.\n", dir_id);
+        seaf_debug ("Dirent name not set for dir object %s.\n", dir_id);
         return NULL;
     }
 
@@ -1266,7 +1244,7 @@ parse_dirent (const char *dir_id, int version, json_t *object)
     if (S_ISREG(mode)) {
         modifier = json_object_get_string_member (object, "modifier");
         if (!modifier) {
-            seaf_warning ("Dirent modifier not set for dir object %s.\n", dir_id);
+            seaf_debug ("Dirent modifier not set for dir object %s.\n", dir_id);
             return NULL;
         }
         size = json_object_get_int_member (object, "size");
@@ -1298,20 +1276,20 @@ seaf_dir_from_json_object (const char *dir_id, json_t *object)
     /* Sanity checks. */
     type = json_object_get_int_member (object, "type");
     if (type != SEAF_METADATA_TYPE_DIR) {
-        seaf_warning ("Object %s is not a dir.\n", dir_id);
+        seaf_debug ("Object %s is not a dir.\n", dir_id);
         return NULL;
     }
 
     version = (int) json_object_get_int_member (object, "version");
     if (version < 1) {
-        seaf_warning ("Dir object %s version should be > 0, version is %d.\n",
-                      dir_id, version);
+        seaf_debug ("Dir object %s version should be > 0, version is %d.\n",
+                    dir_id, version);
         return NULL;
     }
 
     dirent_array = json_object_get (object, "dirents");
     if (!dirent_array) {
-        seaf_warning ("No dirents in dir object %s.\n", dir_id);
+        seaf_debug ("No dirents in dir object %s.\n", dir_id);
         return NULL;
     }
 
@@ -1357,10 +1335,7 @@ seaf_dir_from_json (const char *dir_id, uint8_t *data, int len)
     object = json_loadb ((const char *)decompressed, outlen, 0, &error);
     g_free (decompressed);
     if (!object) {
-        if (error.text)
-            g_warning ("Failed to load seafdir json object: %s.\n", error.text);
-        else
-            g_warning ("Failed to load seafdir json object.\n");
+        seaf_warning ("Failed to load seafdir json object: %s.\n", error.text);
         return NULL;
     }
 
@@ -1528,13 +1503,14 @@ seaf_fs_manager_get_seafdir (SeafFSManager *mgr,
 
     if (memcmp (dir_id, EMPTY_SHA1, 40) == 0) {
         dir = g_new0 (SeafDir, 1);
+        dir->version = version;
         memset (dir->dir_id, '0', 40);
         return dir;
     }
 
     if (seaf_obj_store_read_obj (mgr->obj_store, repo_id, version,
                                  dir_id, &data, &len) < 0) {
-        g_warning ("[fs mgr] Failed to read dir %s.\n", dir_id);
+        seaf_warning ("[fs mgr] Failed to read dir %s.\n", dir_id);
         return NULL;
     }
 
@@ -1596,6 +1572,30 @@ seaf_fs_manager_get_seafdir_sorted (SeafFSManager *mgr,
     return dir;
 }
 
+SeafDir *
+seaf_fs_manager_get_seafdir_sorted_by_path (SeafFSManager *mgr,
+                                            const char *repo_id,
+                                            int version,
+                                            const char *root_id,
+                                            const char *path)
+{
+    SeafDir *dir = seaf_fs_manager_get_seafdir_by_path (mgr, repo_id,
+                                                        version, root_id,
+                                                        path, NULL);
+
+    if (!dir)
+        return NULL;
+
+    /* Only some very old dir objects are not sorted. */
+    if (version > 0)
+        return dir;
+
+    if (!is_dirents_sorted (dir->entries))
+        dir->entries = g_list_sort (dir->entries, compare_dirents);
+
+    return dir;
+}
+
 static int
 parse_metadata_type_v0 (const uint8_t *data, int len)
 {
@@ -1624,10 +1624,7 @@ parse_metadata_type_json (const char *obj_id, uint8_t *data, int len)
     object = json_loadb ((const char *)decompressed, outlen, 0, &error);
     g_free (decompressed);
     if (!object) {
-        if (error.text)
-            g_warning ("Failed to load fs json object: %s.\n", error.text);
-        else
-            g_warning ("Failed to load fs json object.\n");
+        seaf_warning ("Failed to load fs json object: %s.\n", error.text);
         return SEAF_METADATA_TYPE_INVALID;
     }
 
@@ -1680,10 +1677,7 @@ fs_object_from_json (const char *obj_id, uint8_t *data, int len)
     object = json_loadb ((const char *)decompressed, outlen, 0, &error);
     g_free (decompressed);
     if (!object) {
-        if (error.text)
-            g_warning ("Failed to load fs json object: %s.\n", error.text);
-        else
-            g_warning ("Failed to load fs json object.\n");
+        seaf_warning ("Failed to load fs json object: %s.\n", error.text);
         return NULL;
     }
 
@@ -1754,7 +1748,7 @@ block_list_insert (BlockList *bl, const char *block_id)
         return;
 
     char *key = g_strdup(block_id);
-    g_hash_table_insert (bl->block_hash, key, key);
+    g_hash_table_replace (bl->block_hash, key, key);
     g_ptr_array_add (bl->block_ids, g_strdup(block_id));
     ++bl->n_blocks;
 }
@@ -1773,7 +1767,7 @@ block_list_difference (BlockList *bl1, BlockList *bl2)
         block_id = g_ptr_array_index (bl1->block_ids, i);
         if (g_hash_table_lookup (bl2->block_hash, block_id) == NULL) {
             key = g_strdup(block_id);
-            g_hash_table_insert (bl->block_hash, key, key);
+            g_hash_table_replace (bl->block_hash, key, key);
             g_ptr_array_add (bl->block_ids, g_strdup(block_id));
             ++bl->n_blocks;
         }
@@ -1827,7 +1821,7 @@ traverse_dir (SeafFSManager *mgr,
 
     dir = seaf_fs_manager_get_seafdir (mgr, repo_id, version, id);
     if (!dir) {
-        g_warning ("[fs-mgr]get seafdir %s failed\n", id);
+        seaf_warning ("[fs-mgr]get seafdir %s failed\n", id);
         if (skip_errors)
             return 0;
         return -1;
@@ -1873,6 +1867,85 @@ seaf_fs_manager_traverse_tree (SeafFSManager *mgr,
     return traverse_dir (mgr, repo_id, version, root_id, callback, user_data, skip_errors);
 }
 
+static int
+traverse_dir_path (SeafFSManager *mgr,
+                   const char *repo_id,
+                   int version,
+                   const char *dir_path,
+                   SeafDirent *dent,
+                   TraverseFSPathCallback callback,
+                   void *user_data)
+{
+    SeafDir *dir;
+    GList *p;
+    SeafDirent *seaf_dent;
+    gboolean stop = FALSE;
+    char *sub_path;
+    int ret = 0;
+
+    if (!callback (mgr, dir_path, dent, user_data, &stop))
+        return -1;
+
+    if (stop)
+        return 0;
+
+    dir = seaf_fs_manager_get_seafdir (mgr, repo_id, version, dent->id);
+    if (!dir) {
+        seaf_warning ("get seafdir %s:%s failed\n", repo_id, dent->id);
+        return -1;
+    }
+
+    for (p = dir->entries; p; p = p->next) {
+        seaf_dent = (SeafDirent *)p->data;
+        sub_path = g_strconcat (dir_path, "/", seaf_dent->name, NULL);
+
+        if (S_ISREG(seaf_dent->mode)) {
+            if (!callback (mgr, sub_path, seaf_dent, user_data, &stop)) {
+                g_free (sub_path);
+                ret = -1;
+                break;
+            }
+        } else if (S_ISDIR(seaf_dent->mode)) {
+            if (traverse_dir_path (mgr, repo_id, version, sub_path, seaf_dent,
+                                   callback, user_data) < 0) {
+                g_free (sub_path);
+                ret = -1;
+                break;
+            }
+        }
+        g_free (sub_path);
+    }
+
+    seaf_dir_free (dir);
+    return ret;
+}
+
+int
+seaf_fs_manager_traverse_path (SeafFSManager *mgr,
+                               const char *repo_id,
+                               int version,
+                               const char *root_id,
+                               const char *dir_path,
+                               TraverseFSPathCallback callback,
+                               void *user_data)
+{
+    SeafDirent *dent;
+    int ret = 0;
+
+    dent = seaf_fs_manager_get_dirent_by_path (mgr, repo_id, version,
+                                               root_id, dir_path, NULL);
+    if (!dent) {
+        seaf_warning ("Failed to get dirent for %.8s:%s.\n", repo_id, dir_path);
+        return -1;
+    }
+
+    ret = traverse_dir_path (mgr, repo_id, version, dir_path, dent,
+                             callback, user_data);
+
+    seaf_dirent_free (dent);
+    return ret;
+}
+
 static gboolean
 fill_blocklist (SeafFSManager *mgr,
                 const char *repo_id, int version,
@@ -1886,7 +1959,7 @@ fill_blocklist (SeafFSManager *mgr,
     if (type == SEAF_METADATA_TYPE_FILE) {
         seafile = seaf_fs_manager_get_seafile (mgr, repo_id, version, obj_id);
         if (!seafile) {
-            g_warning ("[fs mgr] Failed to find file %s.\n", obj_id);
+            seaf_warning ("[fs mgr] Failed to find file %s.\n", obj_id);
             return FALSE;
         }
 
@@ -1924,6 +1997,15 @@ seaf_fs_manager_object_exists (SeafFSManager *mgr,
     return seaf_obj_store_obj_exists (mgr->obj_store, repo_id, version, id);
 }
 
+void
+seaf_fs_manager_delete_object (SeafFSManager *mgr,
+                               const char *repo_id,
+                               int version,
+                               const char *id)
+{
+    seaf_obj_store_delete_obj (mgr->obj_store, repo_id, version, id);
+}
+
 gint64
 seaf_fs_manager_get_file_size (SeafFSManager *mgr,
                                const char *repo_id,
@@ -1935,7 +2017,7 @@ seaf_fs_manager_get_file_size (SeafFSManager *mgr,
 
     file = seaf_fs_manager_get_seafile (seaf->fs_mgr, repo_id, version, file_id);
     if (!file) {
-        seaf_warning ("Couldn't get file %s\n", file_id);
+        seaf_warning ("Couldn't get file %s:%s\n", repo_id, file_id);
         return -1;
     }
 
@@ -2060,6 +2142,7 @@ seaf_fs_manager_get_seafdir_by_path (SeafFSManager *mgr,
     dir = seaf_fs_manager_get_seafdir (mgr, repo_id, version, dir_id);
     if (!dir) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_DIR_MISSING, "directory is missing");
+        g_free (tmp_path);
         return NULL;
     }
 
@@ -2133,7 +2216,7 @@ seaf_fs_manager_path_to_obj_id (SeafFSManager *mgr,
     if (!slash) {
         base_dir = seaf_fs_manager_get_seafdir (mgr, repo_id, version, root_id);
         if (!base_dir) {
-            g_warning ("Failed to find root dir %s.\n", root_id);
+            seaf_warning ("Failed to find root dir %s.\n", root_id);
             g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL, " ");
             goto out;
         }
@@ -2152,18 +2235,24 @@ seaf_fs_manager_path_to_obj_id (SeafFSManager *mgr,
             !g_error_matches(tmp_error,
                              SEAFILE_DOMAIN,
                              SEAF_ERR_PATH_NO_EXIST)) {
-            g_warning ("Failed to get dir for %s.\n", copy);
+            seaf_warning ("Failed to get dir for %s.\n", copy);
             g_propagate_error (error, tmp_error);
             goto out;
         }
 
         /* The path doesn't exist in this commit. */
-        if (!base_dir)
+        if (!base_dir) {
+            g_propagate_error (error, tmp_error);
             goto out;
+        }
     }
 
     for (p = base_dir->entries; p != NULL; p = p->next) {
         dent = p->data;
+
+        if (!is_object_id_valid (dent->id))
+            continue;
+
         if (strcmp (dent->name, name) == 0) {
             obj_id = g_strdup (dent->id);
             if (mode) {
@@ -2230,6 +2319,54 @@ seaf_fs_manager_get_seafdir_id_by_path (SeafFSManager *mgr,
     return dir_id;
 }
 
+SeafDirent *
+seaf_fs_manager_get_dirent_by_path (SeafFSManager *mgr,
+                                    const char *repo_id,
+                                    int version,
+                                    const char *root_id,
+                                    const char *path,
+                                    GError **error)
+{
+    SeafDirent *dent = NULL;
+    SeafDir *dir = NULL;
+    char *parent_dir = NULL;
+    char *file_name = NULL;
+
+    parent_dir  = g_path_get_dirname(path);
+    file_name = g_path_get_basename(path);
+
+    if (strcmp (parent_dir, ".") == 0) {
+        dir = seaf_fs_manager_get_seafdir (mgr, repo_id, version, root_id);
+        if (!dir) {
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_DIR_MISSING, "directory is missing");
+        }
+    } else
+        dir = seaf_fs_manager_get_seafdir_by_path (mgr, repo_id, version,
+                                                   root_id, parent_dir, error);
+
+    if (!dir) {
+        seaf_warning ("dir %s doesn't exist in repo %.8s.\n", parent_dir, repo_id);
+        goto out;
+    }
+
+    GList *p;
+    for (p = dir->entries; p; p = p->next) {
+        SeafDirent *d = p->data;
+        if (strcmp (d->name, file_name) == 0) {
+            dent = seaf_dirent_dup(d);
+            break;
+        }
+    }
+
+out:
+    if (dir)
+        seaf_dir_free (dir);
+    g_free (parent_dir);
+    g_free (file_name);
+
+    return dent;
+}
+
 static gboolean
 verify_seafdir_v0 (const char *dir_id, const uint8_t *data, int len,
                    gboolean verify_id)
@@ -2242,8 +2379,9 @@ verify_seafdir_v0 (const char *dir_id, const uint8_t *data, int len,
     const uint8_t *ptr;
     int remain;
     int dirent_base_size;
-    SHA_CTX ctx;
+    GChecksum *ctx;
     uint8_t sha1[20];
+    gsize cs_len = 20;
     char check_id[41];
 
     if (len < sizeof(SeafdirOndisk)) {
@@ -2262,7 +2400,7 @@ verify_seafdir_v0 (const char *dir_id, const uint8_t *data, int len,
     }
 
     if (verify_id)
-        SHA1_Init (&ctx);
+        ctx = g_checksum_new (G_CHECKSUM_SHA1);
 
     dirent_base_size = 2 * sizeof(guint32) + 40;
     while (remain > dirent_base_size) {
@@ -2287,17 +2425,18 @@ verify_seafdir_v0 (const char *dir_id, const uint8_t *data, int len,
             if (G_BYTE_ORDER == G_BIG_ENDIAN)
                 mode = GUINT32_SWAP_LE_BE (mode);
 
-            SHA1_Update (&ctx, id, 40);
-            SHA1_Update (&ctx, name, name_len);
-            SHA1_Update (&ctx, &mode, sizeof(mode));
+            g_checksum_update (ctx, (unsigned char *)id, 40);
+            g_checksum_update (ctx, (unsigned char *)name, name_len);
+            g_checksum_update (ctx, (unsigned char *)&mode, sizeof(mode));
         }
     }
 
     if (!verify_id)
         return TRUE;
 
-    SHA1_Final (sha1, &ctx);
+    g_checksum_get_digest (ctx, sha1, &cs_len);
     rawdata_to_hex (sha1, check_id, 20);
+    g_checksum_free (ctx);
 
     if (strcmp (check_id, dir_id) == 0)
         return TRUE;
@@ -2352,7 +2491,7 @@ seaf_fs_manager_verify_seafdir (SeafFSManager *mgr,
 
     if (seaf_obj_store_read_obj (mgr->obj_store, repo_id, version,
                                  dir_id, &data, &len) < 0) {
-        seaf_warning ("[fs mgr] Failed to read dir %s.\n", dir_id);
+        seaf_warning ("[fs mgr] Failed to read dir %s:%s.\n", repo_id, dir_id);
         *io_error = TRUE;
         return FALSE;
     }
@@ -2367,8 +2506,9 @@ static gboolean
 verify_seafile_v0 (const char *id, const void *data, int len, gboolean verify_id)
 {
     const SeafileOndisk *ondisk = data;
-    SHA_CTX ctx;
+    GChecksum *ctx;
     uint8_t sha1[20];
+    gsize cs_len = 20;
     char check_id[41];
 
     if (len < sizeof(SeafileOndisk)) {
@@ -2390,9 +2530,10 @@ verify_seafile_v0 (const char *id, const void *data, int len, gboolean verify_id
     if (!verify_id)
         return TRUE;
 
-    SHA1_Init (&ctx);
-    SHA1_Update (&ctx, ondisk->block_ids, len - sizeof(SeafileOndisk));
-    SHA1_Final (sha1, &ctx);
+    ctx = g_checksum_new (G_CHECKSUM_SHA1);
+    g_checksum_update (ctx, ondisk->block_ids, len - sizeof(SeafileOndisk));
+    g_checksum_get_digest (ctx, sha1, &cs_len);
+    g_checksum_free (ctx);
 
     rawdata_to_hex (sha1, check_id, 20);
 
@@ -2429,7 +2570,7 @@ seaf_fs_manager_verify_seafile (SeafFSManager *mgr,
 
     if (seaf_obj_store_read_obj (mgr->obj_store, repo_id, version,
                                  file_id, &data, &len) < 0) {
-        seaf_warning ("[fs mgr] Failed to read file %s.\n", file_id);
+        seaf_warning ("[fs mgr] Failed to read file %s:%s.\n", repo_id, file_id);
         *io_error = TRUE;
         return FALSE;
     }
@@ -2482,7 +2623,7 @@ seaf_fs_manager_verify_object (SeafFSManager *mgr,
 
     if (seaf_obj_store_read_obj (mgr->obj_store, repo_id, version,
                                  obj_id, &data, &len) < 0) {
-        seaf_warning ("[fs mgr] Failed to read object %s.\n", obj_id);
+        seaf_warning ("[fs mgr] Failed to read object %s:%s.\n", repo_id, obj_id);
         *io_error = TRUE;
         return FALSE;
     }
@@ -2512,4 +2653,11 @@ seafile_version_from_repo_version (int repo_version)
         return 0;
     else
         return CURRENT_SEAFILE_OBJ_VERSION;
+}
+
+int
+seaf_fs_manager_remove_store (SeafFSManager *mgr,
+                              const char *store_id)
+{
+    return seaf_obj_store_remove_store (mgr->obj_store, store_id);
 }

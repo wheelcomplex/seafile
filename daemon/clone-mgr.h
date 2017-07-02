@@ -13,22 +13,24 @@ typedef struct _SeafCloneManager SeafCloneManager;
 
 enum {
     CLONE_STATE_INIT,
-    CLONE_STATE_CONNECT,
-    CLONE_STATE_CHECK_PROTOCOL,
-    CLONE_STATE_INDEX,
+    CLONE_STATE_CHECK_SERVER,
     CLONE_STATE_FETCH,
-    CLONE_STATE_CHECKOUT,
-    CLONE_STATE_MERGE,
     CLONE_STATE_DONE,
     CLONE_STATE_ERROR,
     CLONE_STATE_CANCEL_PENDING,
     CLONE_STATE_CANCELED,
+    /* States only used by non-http protocol. */
+    CLONE_STATE_CONNECT,
+    CLONE_STATE_CHECK_PROTOCOL,
+    CLONE_STATE_INDEX,
+    CLONE_STATE_CHECKOUT,
+    CLONE_STATE_MERGE,
     N_CLONE_STATES,
 };
 
 enum {
     CLONE_OK,
-    CLONE_ERROR_CONNECT,
+    CLONE_ERROR_CHECK_SERVER,
     CLONE_ERROR_INDEX,
     CLONE_ERROR_FETCH,
     CLONE_ERROR_PASSWD,
@@ -42,6 +44,7 @@ struct _CloneTask {
     SeafCloneManager    *manager;
     int                  state;
     int                  error;
+    char                *err_detail;
     char                 repo_id[37];
     int                  repo_version;
     char                 peer_id[41];
@@ -56,6 +59,15 @@ struct _CloneTask {
     int                  enc_version;
     char                *random_key;
     char                 root_id[41];
+    gboolean             is_readonly;
+
+    /* Http sync fields */
+    char                *server_url;
+    char                *effective_url;
+    gboolean             use_fileserver_port;
+    int                  http_protocol_version;
+    gboolean             http_sync;
+    char                 server_head_id[41];
 
     gboolean             server_side_merge;
 };
@@ -102,6 +114,7 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
                              const char *peer_addr,
                              const char *peer_port,
                              const char *email,
+                             const char *more_info,
                              GError **error);
 
 /*
@@ -124,6 +137,7 @@ seaf_clone_manager_add_download_task (SeafCloneManager *mgr,
                                       const char *peer_addr,
                                       const char *peer_port,
                                       const char *email,
+                                      const char *more_info,
                                       GError **error);
 
 int

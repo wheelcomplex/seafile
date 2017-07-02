@@ -13,7 +13,9 @@
 #include "utils.h"
 #include "db.h"
 
+#ifndef USE_GPL_CRYPTO
 #include <openssl/rand.h>
+#endif
 
 #include "seafile-session.h"
 #include "transfer-mgr.h"
@@ -29,8 +31,9 @@
 #include "mq-mgr.h"
 #include "seafile-config.h"
 
-#include "processors/check-tx-v2-proc.h"
+#ifndef USE_GPL_CRYPTO
 #include "processors/check-tx-v3-proc.h"
+#endif
 #include "processors/sendfs-proc.h"
 #include "processors/getfs-proc.h"
 #include "processors/getcs-proc.h"
@@ -155,7 +158,8 @@ static const char *transfer_task_error_strs[] = {
     "Failed to start block transfer client.",
     "Failed to upload blocks.",
     "Failed to download blocks.",
-    "Server version is too old."
+    "Server version is too old.",
+    "Files are locked by other application.",
 };
 
 const char *
@@ -241,6 +245,7 @@ seaf_transfer_task_free (TransferTask *task)
     g_free (task->from_branch);
     g_free (task->to_branch);
     g_free (task->token);
+    g_free (task->email);
 
     if (task->fs_roots)
         object_list_free (task->fs_roots);
@@ -401,18 +406,6 @@ transfer_task_with_proc_failure (TransferTask *task,
     }
 }
 
-inline static gboolean is_peer_relay (const char *peer_id)
-{
-    CcnetPeer *peer = ccnet_get_peer(seaf->ccnetrpc_client, peer_id);
-
-    if (!peer)
-        return FALSE;
-
-    gboolean is_relay = string_list_is_exists(peer->role_list, "MyRelay");
-    g_object_unref (peer);
-    return is_relay;
-}
-
 /*
  * Transfer Manager.
  */
@@ -438,31 +431,16 @@ seaf_transfer_manager_new (struct _SeafileSession *seaf)
         return NULL;
     }
 
-    gboolean exists;
-    int download_limit = seafile_session_config_get_int (seaf,
-                                                         KEY_DOWNLOAD_LIMIT,
-                                                         &exists);
-    if (exists)
-        mgr->download_limit = download_limit;
-
-    int upload_limit = seafile_session_config_get_int (seaf,
-                                                       KEY_UPLOAD_LIMIT,
-                                                       &exists);
-    if (exists)
-        mgr->upload_limit = upload_limit;
-
     return mgr;
 }
 
 static void register_processors (CcnetClient *client)
 {
-    ccnet_proc_factory_register_processor (client->proc_factory,
-                                           "seafile-check-tx-v2",
-                                           SEAFILE_TYPE_CHECK_TX_V2_PROC);
-
+#ifndef USE_GPL_CRYPTO
     ccnet_proc_factory_register_processor (client->proc_factory,
                                            "seafile-check-tx-v3",
                                            SEAFILE_TYPE_CHECK_TX_V3_PROC);
+#endif
 
     ccnet_proc_factory_register_processor (client->proc_factory,
                                            "seafile-sendfs",
@@ -597,11 +575,12 @@ seaf_transfer_manager_add_download (SeafTransferManager *manager,
                                     gboolean server_side_merge,
                                     const char *passwd,
                                     const char *worktree,
+                                    const char *email,
                                     GError **error)
 {
     TransferTask *task;
 
-    if (!repo_id || !from_branch || !to_branch || !token) {
+    if (!repo_id || !from_branch || !to_branch || !token || !email) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Empty argument(s)");
         return NULL;
     }
@@ -617,6 +596,7 @@ seaf_transfer_manager_add_download (SeafTransferManager *manager,
                                    TASK_TYPE_DOWNLOAD);
     task->state = TASK_STATE_NORMAL;
     task->repo_version = repo_version;
+    task->email = g_strdup(email);
 
     task->server_side_merge = server_side_merge;
 
@@ -837,7 +817,7 @@ retry:
     block_tx_client_run_command (info, BLOCK_CLIENT_CMD_TRANSFER);
 
     /* Wait until block download is done. */
-    piperead (info->done_pipe[0], &rsp, sizeof(rsp));
+    piperead (info->done_pipe[0], (char*)&rsp, sizeof(rsp));
 
     /* The server closes the socket after 30 seconds without data,
      * so just retry if we encounter network error.
@@ -845,7 +825,7 @@ retry:
     if (rsp == BLOCK_CLIENT_NET_ERROR) {
         block_tx_client_run_command (info, BLOCK_CLIENT_CMD_RESTART);
 
-        piperead (info->done_pipe[0], &rsp, sizeof(rsp));
+        piperead (info->done_pipe[0], (char*)&rsp, sizeof(rsp));
         if (rsp == BLOCK_CLIENT_READY)
             goto retry;
     }
@@ -881,7 +861,7 @@ load_blocklist_with_local_history (TransferTask *task)
                                                  task->repo_version,
                                                  commit_id);
         if (!commit) {
-            seaf_warning ("Failed to get commit %s.\n", commit_id);
+            seaf_warning ("Failed to get commit %s:%s.\n", task->repo_id, commit_id);
             block_list_free (bl1);
             return NULL;
         }
@@ -1028,7 +1008,8 @@ diff_files (int n, const char *basedir, SeafDirent *files[], void *vdata)
                                               task->repo_id, task->repo_version,
                                               file1->id);
             if (!f1) {
-                seaf_warning ("Failed to get seafile object %s.\n", file1->id);
+                seaf_warning ("Failed to get seafile object %s:%s.\n",
+                              task->repo_id, file1->id);
                 return -1;
             }
             for (i = 0; i < f1->n_blocks; ++i)
@@ -1039,7 +1020,8 @@ diff_files (int n, const char *basedir, SeafDirent *files[], void *vdata)
                                               task->repo_id, task->repo_version,
                                               file1->id);
             if (!f1) {
-                seaf_warning ("Failed to get seafile object %s.\n", file1->id);
+                seaf_warning ("Failed to get seafile object %s:%s.\n",
+                              task->repo_id, file1->id);
                 return -1;
             }
             f2 = seaf_fs_manager_get_seafile (seaf->fs_mgr,
@@ -1047,7 +1029,8 @@ diff_files (int n, const char *basedir, SeafDirent *files[], void *vdata)
                                               file2->id);
             if (!f2) {
                 seafile_unref (f1);
-                seaf_warning ("Failed to get seafile object %s.\n", file2->id);
+                seaf_warning ("Failed to get seafile object %s:%s.\n",
+                              task->repo_id, file2->id);
                 return -1;
             }
 
@@ -1081,8 +1064,9 @@ static int
 load_blocklist_v2 (TransferTask *task)
 {
     int ret = 0;
-
     SeafBranch *local = NULL, *master = NULL;
+    SeafCommit *local_head = NULL, *master_head = NULL;
+
     local = seaf_branch_manager_get_branch (seaf->branch_mgr, task->repo_id, "local");
     if (!local) {
         seaf_warning ("Branch local not found for repo %.8s.\n", task->repo_id);
@@ -1096,7 +1080,6 @@ load_blocklist_v2 (TransferTask *task)
         goto out;
     }
 
-    SeafCommit *local_head = NULL, *master_head = NULL;
     local_head = seaf_commit_manager_get_commit (seaf->commit_mgr,
                                                  task->repo_id, task->repo_version,
                                                  local->commit_id);
@@ -1231,11 +1214,13 @@ generate_session_key (BlockTxInfo *info, const char *peer_id)
     char *sk_base64, *sk_enc_base64;
     gsize enc_key_len;
 
+#ifndef USE_GPL_CRYPTO
     if (RAND_bytes (info->session_key, sizeof(info->session_key)) != 1) {
         seaf_warning ("Failed to generate random session key with RAND_bytes(), "
                       "switch to RAND_pseudo_bytes().\n");
         RAND_pseudo_bytes (info->session_key, sizeof(info->session_key));
     }
+#endif
 
     sk_base64 = g_base64_encode (info->session_key, sizeof(info->session_key));
     sk_enc_base64 = ccnet_pubkey_encrypt (seaf->ccnetrpc_client,
@@ -1387,14 +1372,14 @@ download_and_checkout_files_thread (void *vdata)
     TransferTask *task = data->task;
     int rsp;
 
-    piperead (task->tx_info->done_pipe[0], &rsp, sizeof(rsp));
+    piperead (task->tx_info->done_pipe[0], (char*)&rsp, sizeof(rsp));
 
     if (rsp == BLOCK_CLIENT_READY) {
-        data->status = seaf_repo_fetch_and_checkout (task, task->head);
+        data->status = seaf_repo_fetch_and_checkout (task, NULL, FALSE, task->head);
 
         block_tx_client_run_command (task->tx_info, BLOCK_CLIENT_CMD_END);
 
-        piperead (task->tx_info->done_pipe[0], &rsp, sizeof(rsp));
+        piperead (task->tx_info->done_pipe[0], (char*)&rsp, sizeof(rsp));
     } else
         /* block-tx-client thread should have exited. */
         data->status = FETCH_CHECKOUT_FAILED;
@@ -1428,6 +1413,9 @@ download_and_checkout_files_done (void *vdata)
         break;
     case FETCH_CHECKOUT_CANCELED:
         transition_state (task, TASK_STATE_CANCELED, TASK_RT_STATE_FINISHED);
+        break;
+    case FETCH_CHECKOUT_LOCKED:
+        transition_state_to_error (task, TASK_ERR_FILES_LOCKED);
         break;
     }
 
@@ -1739,6 +1727,7 @@ start_download (TransferTask *task)
     if (!ccnet_peer_is_ready (seaf->ccnetrpc_client, dest_id))
         return -1;
 
+#ifndef USE_GPL_CRYPTO
     processor = ccnet_proc_factory_create_remote_master_processor (
         seaf->session->proc_factory, "seafile-check-tx-v3", dest_id);
     if (!processor) {
@@ -1754,6 +1743,7 @@ start_download (TransferTask *task)
         seaf_warning ("failed to start check-tx proc for download.\n");
         return -1;
     }
+#endif
 
     transition_state (task, task->state, TASK_RT_STATE_CHECK);
     return 0;
@@ -1805,12 +1795,6 @@ update_local_repo (TransferTask *task)
         branch = seaf_branch_new ("master", task->repo_id, task->head);
         seaf_branch_manager_add_branch (seaf->branch_mgr, branch);
         seaf_branch_unref (branch);
-
-        /* Set relay to where this repo from. */
-        if (is_peer_relay (task->dest_id)) {
-            seaf_repo_manager_set_repo_relay_id (seaf->repo_mgr, repo,
-                                                 task->dest_id);
-        }
     } else {
         if (!repo) {
             transition_state_to_error (task, TASK_ERR_UNKNOWN);
@@ -2214,6 +2198,7 @@ start_upload (TransferTask *task)
     memcpy (task->head, branch->commit_id, 41);
     seaf_branch_unref (branch);
 
+#ifndef USE_GPL_CRYPTO
     processor = ccnet_proc_factory_create_remote_master_processor (
         seaf->session->proc_factory, "seafile-check-tx-v3", dest_id);
     if (!processor) {
@@ -2230,6 +2215,7 @@ start_upload (TransferTask *task)
         seaf_warning ("failed to start check-tx-v3 proc for upload.\n");
         return -1;
     }
+#endif
 
     transition_state (task, task->state, TASK_RT_STATE_CHECK);
     return 0;
@@ -2343,56 +2329,6 @@ state_machine_tick (TransferTask *task)
     }
 }
 
-
-static inline void 
-format_transfer_task_detail (TransferTask *task, GString *buf)
-{
-    SeafRepo *repo = seaf_repo_manager_get_repo (seaf->repo_mgr,
-                                                 task->repo_id);
-    char *repo_name;
-    char *type;
-    
-    if (repo) {
-        repo_name = repo->name;
-        type = (task->type == TASK_TYPE_UPLOAD) ? "upload" : "download";
-        
-    } else if (task->is_clone) {
-        CloneTask *ctask;
-        ctask = seaf_clone_manager_get_task (seaf->clone_mgr, task->repo_id);
-        repo_name = ctask->repo_name;
-        type = "download";
-        
-    } else {
-        return;
-    }
-    int rate = transfer_task_get_rate(task);
-
-    g_string_append_printf (buf, "%s\t%d %s\n", type, rate, repo_name);
-}
-
-/*
- * Publish a notification message to report :
- *
- *      [uploading/downloading]\t[transfer-rate] [repo-name]\n
- */
-static void
-send_transfer_message (GList *tasks)
-{
-    GList *ptr;
-    TransferTask *task;
-    GString *buf = g_string_new (NULL);
-
-    for (ptr = tasks; ptr; ptr = ptr->next) {
-        task = ptr->data;
-        format_transfer_task_detail(task, buf);
-    }
-        
-    seaf_mq_manager_publish_notification (seaf->mq_mgr, "transfer",
-                                          buf->str);
-
-    g_string_free (buf, TRUE);
-}
-
 static int
 schedule_task_pulse (void *vmanager)
 {
@@ -2401,58 +2337,17 @@ schedule_task_pulse (void *vmanager)
     gpointer key, value;
     TransferTask *task;
 
-    GList *tasks_in_transfer = NULL;
-
     g_hash_table_iter_init (&iter, mgr->download_tasks);
     while (g_hash_table_iter_next (&iter, &key, &value)) {
         task = value;
         state_machine_tick (task);
-        if ((task->state == TASK_STATE_NORMAL)
-            && (task->runtime_state == TASK_RT_STATE_COMMIT ||
-                task->runtime_state == TASK_RT_STATE_FS ||
-                task->runtime_state == TASK_RT_STATE_CHECK_BLOCKS ||
-                task->runtime_state == TASK_RT_STATE_CHUNK_SERVER ||
-                task->runtime_state == TASK_RT_STATE_DATA)) {
-            tasks_in_transfer = g_list_prepend (tasks_in_transfer, task);
-        }
     }
 
     g_hash_table_iter_init (&iter, mgr->upload_tasks);
     while (g_hash_table_iter_next (&iter, &key, &value)) {
         task = value;
         state_machine_tick (task);
-        if ((task->state == TASK_STATE_NORMAL)
-            && (task->runtime_state == TASK_RT_STATE_COMMIT ||
-                task->runtime_state == TASK_RT_STATE_FS ||
-                task->runtime_state == TASK_RT_STATE_CHECK_BLOCKS ||
-                task->runtime_state == TASK_RT_STATE_CHUNK_SERVER ||
-                task->runtime_state == TASK_RT_STATE_DATA)) {
-            tasks_in_transfer = g_list_prepend (tasks_in_transfer, task);
-        }
     }
-
-    if (tasks_in_transfer) {
-        send_transfer_message (tasks_in_transfer);
-        g_list_free (tasks_in_transfer);
-    }
-
-    /* Save tx_bytes to last_tx_bytes and reset tx_bytes to 0 every second */
-    g_hash_table_iter_init (&iter, mgr->download_tasks);
-    while (g_hash_table_iter_next (&iter, &key, &value)) {
-        task = value;
-        task->last_tx_bytes = g_atomic_int_get (&task->tx_bytes);
-        g_atomic_int_set (&task->tx_bytes, 0);
-    }
-
-    g_hash_table_iter_init (&iter, mgr->upload_tasks);
-    while (g_hash_table_iter_next (&iter, &key, &value)) {
-        task = value;
-        task->last_tx_bytes = g_atomic_int_get (&task->tx_bytes);
-        g_atomic_int_set (&task->tx_bytes, 0);
-    }
-
-    g_atomic_int_set (&mgr->sent_bytes, 0);
-    g_atomic_int_set (&mgr->recv_bytes, 0);
 
     return TRUE;
 }

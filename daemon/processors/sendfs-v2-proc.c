@@ -200,6 +200,7 @@ calculate_send_object_list (void *vdata)
     TransferTask *task = proc->tx_task;
 
     SeafBranch *local = NULL, *master = NULL;
+    SeafCommit *local_head = NULL, *master_head = NULL;
     local = seaf_branch_manager_get_branch (seaf->branch_mgr, task->repo_id, "local");
     if (!local) {
         seaf_warning ("Branch local not found for repo %.8s.\n", task->repo_id);
@@ -213,7 +214,6 @@ calculate_send_object_list (void *vdata)
         goto out;
     }
 
-    SeafCommit *local_head = NULL, *master_head = NULL;
     local_head = seaf_commit_manager_get_commit (seaf->commit_mgr,
                                                  task->repo_id, task->repo_version,
                                                  local->commit_id);
@@ -234,7 +234,8 @@ calculate_send_object_list (void *vdata)
     }
 
     /* Diff won't traverse the root object itself. */
-    if (strcmp (local_head->root_id, master_head->root_id) != 0)
+    if (strcmp (local_head->root_id, master_head->root_id) != 0 &&
+        strcmp (local_head->root_id, EMPTY_SHA1) != 0)
         priv->send_obj_list = g_list_prepend (priv->send_obj_list,
                                               g_strdup(local_head->root_id));
 
@@ -502,7 +503,7 @@ handle_response (CcnetProcessor *processor,
         g_return_if_reached ();
     }
 
-    g_warning ("Bad response: %s %s.\n", code, code_msg);
+    seaf_warning ("Bad response: %s %s.\n", code, code_msg);
     if (memcmp (code, SC_ACCESS_DENIED, 3) == 0)
         transfer_task_set_error (task, TASK_ERR_ACCESS_DENIED);
     ccnet_processor_done (processor, FALSE);

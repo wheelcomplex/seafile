@@ -315,7 +315,7 @@ check_objects_thread (void *vdata)
     thread_data_ref (tdata);
 
     while (1) {
-        int n = piperead (tdata->cmd_pipe, &cmd, sizeof(cmd));
+        int n = piperead (tdata->cmd_pipe, (char*)&cmd, sizeof(cmd));
         if (n < 0) {
             seaf_warning ("Failed to read commnd pipe: %s.\n", strerror(errno));
             goto out;
@@ -370,7 +370,7 @@ check_fs_tree_from (ThreadData *tdata, const char *root_id)
     tdata->fetch_objs = NULL;
 
     int cmd = 1;
-    pipewrite (priv->cmd_pipe[1], &cmd, sizeof(cmd));
+    pipewrite (priv->cmd_pipe[1], (char*)&cmd, sizeof(cmd));
 
     priv->worker_checking = TRUE;
     return 0;
@@ -422,7 +422,7 @@ recv_fs_object (CcnetProcessor *processor, char *content, int clen)
     /* TransferTask *task = ((SeafileGetfsProc *)processor)->tx_task; */
 
     if (clen < sizeof(ObjectPack)) {
-        g_warning ("[getfs] invalid object id.\n");
+        seaf_warning ("[getfs] invalid object id.\n");
         goto bad;
     }
 
@@ -435,7 +435,7 @@ recv_fs_object (CcnetProcessor *processor, char *content, int clen)
     return 0;
 
 bad:
-    g_warning ("Bad fs object received.\n");
+    seaf_warning ("Bad fs object received.\n");
     transfer_task_set_error (((SeafileGetfsProc *)processor)->tx_task,
                              TASK_ERR_DOWNLOAD_FS);
     ccnet_processor_send_update (processor, SC_BAD_OBJECT, SS_BAD_OBJECT,
@@ -567,7 +567,7 @@ handle_response (CcnetProcessor *processor,
         g_return_if_reached ();
     }
 
-    g_warning ("Bad response: %s %s.\n", code, code_msg);
+    seaf_warning ("Bad response: %s %s.\n", code, code_msg);
     if (memcmp (code, SC_ACCESS_DENIED, 3) == 0)
         transfer_task_set_error (task, TASK_ERR_ACCESS_DENIED);
     ccnet_processor_done (processor, FALSE);

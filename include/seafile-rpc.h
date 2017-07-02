@@ -19,6 +19,31 @@ seafile_get_session_info (GError **error);
  */
 GList* seafile_get_repo_list (int start, int limit, GError **error);
 
+gint64
+seafile_count_repos (GError **error);
+
+/**
+ * seafile_get_trash_repo_list:
+ *
+ * Returns deleted repository list.
+ */
+GList* seafile_get_trash_repo_list(int start, int limit, GError **error);
+
+int
+seafile_del_repo_from_trash (const char *repo_id, GError **error);
+
+int
+seafile_restore_repo_from_trash (const char *repo_id, GError **error);
+
+GList *
+seafile_get_trash_repos_by_owner (const char *owner, GError **error);
+
+int
+seafile_empty_repo_trash (GError **error);
+
+int
+seafile_empty_repo_trash_by_owner (const char *owner, GError **error);
+
 /**
  * seafile_get_commit_list:
  *
@@ -93,6 +118,12 @@ int seafile_destroy_repo (const gchar *repo_id, GError **error);
 
 int
 seafile_unsync_repos_by_account (const char *server_addr, const char *email, GError **error);
+
+int
+seafile_remove_repo_tokens_by_account (const char *server_addr, const char *email, GError **error);
+
+int
+seafile_set_repo_token (const char *repo_id, const char *token, GError **error);
 
 int
 seafile_get_download_rate(GError **error);
@@ -171,6 +202,7 @@ seafile_update_repo_relay_info (const char *repo_id,
 int
 seafile_update_repos_server_host (const char *old_host,
                                   const char *new_host,
+                                  const char *new_server_url,
                                   GError **error);
 
 int seafile_disable_auto_sync (GError **error);
@@ -178,6 +210,30 @@ int seafile_disable_auto_sync (GError **error);
 int seafile_enable_auto_sync (GError **error);
 
 int seafile_is_auto_sync_enabled (GError **error);
+
+char *
+seafile_get_path_sync_status (const char *repo_id,
+                              const char *path,
+                              int is_dir,
+                              GError **error);
+
+int
+seafile_mark_file_locked (const char *repo_id, const char *path, GError **error);
+
+int
+seafile_mark_file_unlocked (const char *repo_id, const char *path, GError **error);
+
+char *
+seafile_get_server_property (const char *server_url, const char *key, GError **error);
+
+int
+seafile_set_server_property (const char *server_url,
+                             const char *key,
+                             const char *value,
+                             GError **error);
+
+GList *
+seafile_get_file_sync_errors (int offset, int limit, GError **error);
 
 /**
  * seafile_list_dir:
@@ -191,15 +247,17 @@ GList * seafile_list_dir (const char *repo_id,
                           const char *dir_id, int offset, int limit, GError **error);
 
 /**
- * seafile_list_file:
+ * seafile_list_file_blocks:
  * List the blocks of a file.
  *
  * Returns: a list of block ids speprated by '\n'.
  * 
  * @limit: if limit <= 0, all blocks start from @offset will be returned.
  */
-char * seafile_list_file (const char *repo_id,
-                          const char *file_id, int offset, int limit, GError **error);
+char * seafile_list_file_blocks (const char *repo_id,
+                                 const char *file_id,
+                                 int offset, int limit,
+                                 GError **error);
 
 /**
  * seafile_list_dir_by_path:
@@ -211,13 +269,15 @@ GList * seafile_list_dir_by_path (const char *repo_id,
                                   const char *commit_id, const char *path, GError **error);
 
 /**
- * seafile_get_dirid_by_path:
+ * seafile_get_dir_id_by_commit_and_path:
  * Get the dir_id of the path
  *
  * Returns: the dir_id of the path
  */
-char * seafile_get_dirid_by_path (const char *repo_id,
-                                  const char *commit_id, const char *path, GError **error);
+char * seafile_get_dir_id_by_commit_and_path (const char *repo_id,
+                                              const char *commit_id,
+                                              const char *path,
+                                              GError **error);
 
 /**
  * seafile_revert:
@@ -251,6 +311,7 @@ seafile_clone (const char *repo_id,
                const char *email,
                const char *random_key,
                int enc_version,
+               const char *more_info,
                GError **error);
 
 char *
@@ -267,6 +328,7 @@ seafile_download (const char *repo_id,
                   const char *email,
                   const char *random_key,
                   int enc_version,
+                  const char *more_info,
                   GError **error);
 
 int
@@ -333,26 +395,6 @@ seafile_gc (GError **error);
 /* -----------------  Task Related --------------  */
 
 /**
- * seafile_get_upload_task_list:
- *
- * List all the upload tasks.
- *
- * Returns: A list of task info.
- */
-GList* seafile_get_upload_task_list (GError **error);
-
-
-/**
- * seafile_get_download_task_list:
- *
- * List all the download tasks.
- *
- * Returns: A list of task info.
- */
-GList* seafile_get_download_task_list (GError **error);
-
-
-/**
  * seafile_find_transfer:
  *
  * Find a non finished task of a repo
@@ -381,7 +423,7 @@ int seafile_remove_task (const char *task_id, int task_type, GError **error);
  */
 GList *
 seafile_diff (const char *repo_id, const char *old, const char *new,
-              GError **error);
+              int fold_dir_diff, GError **error);
 
 GList *
 seafile_branch_gets (const char *repo_id, GError **error);
@@ -407,7 +449,7 @@ GList *
 seafile_get_orphan_repo_list(GError **error);
 
 GList *
-seafile_list_owned_repos (const char *email, GError **error);
+seafile_list_owned_repos (const char *email, int ret_corrupted, GError **error);
 
 /**
  * seafile_add_chunk_server:
@@ -451,16 +493,44 @@ seafile_web_get_access_token (const char *repo_id,
                               const char *obj_id,
                               const char *op,
                               const char *username,
+                              int use_onetime,
                               GError **error);
 
 GObject *
 seafile_web_query_access_token (const char *token, GError **error);
+
+char *
+seafile_query_zip_progress (const char *token, GError **error);
 
 GObject *
 seafile_get_checkout_task (const char *repo_id, GError **error);
 
 GList *
 seafile_get_sync_task_list (GError **error);
+
+int
+seafile_share_subdir_to_user (const char *repo_id,
+                              const char *path,
+                              const char *owner,
+                              const char *share_user,
+                              const char *permission,
+                              const char *passwd,
+                              GError **error);
+
+int
+seafile_unshare_subdir_for_user (const char *repo_id,
+                                 const char *path,
+                                 const char *owner,
+                                 const char *share_user,
+                                 GError **error);
+
+int
+seafile_update_share_subdir_perm_for_user (const char *repo_id,
+                                           const char *path,
+                                           const char *owner,
+                                           const char *share_user,
+                                           const char *permission,
+                                           GError **error);
 
 int
 seafile_add_share (const char *repo_id, const char *from_email,
@@ -471,9 +541,41 @@ GList *
 seafile_list_share_repos (const char *email, const char *type,
                           int start, int limit, GError **error);
 
+GList *
+seafile_list_repo_shared_to (const char *from_user, const char *repo_id,
+                             GError **error);
+
+GList *
+seafile_list_repo_shared_group (const char *from_user, const char *repo_id,
+                                GError **error);
+
 int
 seafile_remove_share (const char *repo_id, const char *from_email,
                       const char *to_email, GError **error);
+
+int
+seafile_share_subdir_to_group (const char *repo_id,
+                               const char *path,
+                               const char *owner,
+                               int share_group,
+                               const char *permission,
+                               const char *passwd,
+                               GError **error);
+
+int
+seafile_unshare_subdir_for_group (const char *repo_id,
+                                  const char *path,
+                                  const char *owner,
+                                  int share_group,
+                                  GError **error);
+
+int
+seafile_update_share_subdir_perm_for_group (const char *repo_id,
+                                            const char *path,
+                                            const char *owner,
+                                            int share_group,
+                                            const char *permission,
+                                            GError **error);
 
 int
 seafile_group_share_repo (const char *repo_id, int group_id,
@@ -489,6 +591,9 @@ seafile_get_shared_groups_by_repo(const char *repo_id, GError **error);
 
 char *
 seafile_get_group_repoids (int group_id, GError **error);
+
+GList *
+seafile_get_repos_by_group (int group_id, GError **error);
 
 GList *
 seafile_get_group_repos_by_owner (char *user, GError **error);
@@ -664,6 +769,7 @@ seafile_move_file (const char *src_repo_id,
                    const char *dst_repo_id,
                    const char *dst_dir,
                    const char *dst_filename,
+                   int replace,
                    const char *user,
                    int need_progress,
                    int synchronous,
@@ -709,6 +815,10 @@ char *
 seafile_get_dir_id_by_path (const char *repo_id, const char *path,
                             GError **error);
 
+GObject *
+seafile_get_dirent_by_path (const char *repo_id, const char *path,
+                            GError **error);
+
 /**
  * Return a list of commits where every commit contains a unique version of
  * the file.
@@ -718,6 +828,7 @@ seafile_list_file_revisions (const char *repo_id,
                              const char *path,
                              int max_revision,
                              int limit,
+                             int show_days,
                              GError **error);
 
 GList *
@@ -740,11 +851,18 @@ seafile_revert_dir (const char *repo_id,
                     const char *user,
                     GError **error);
 
+char *
+seafile_check_repo_blocks_missing (const char *repo_id,
+                                   const char *blockids_json,
+                                   GError **error);
+
 /*
  * @show_days: return deleted files in how many days, return all if 0.
  */
 GList *
-seafile_get_deleted (const char *repo_id, int show_days, GError **error);
+seafile_get_deleted (const char *repo_id, int show_days,
+                     const char *path, const char *scan_stat,
+                     int limit, GError **error);
 
 /**
  * Generate a new token for (repo_id, email) and return it
@@ -771,6 +889,10 @@ seafile_list_repo_tokens_by_email (const char *email,
 int
 seafile_delete_repo_tokens_by_peer_id(const char *email, const char *peer_id, GError **error);
 
+int
+seafile_delete_repo_tokens_by_email (const char *email,
+                                     GError **error);
+
 /**
  * create a repo on seahub
  */
@@ -793,6 +915,19 @@ seafile_create_enc_repo (const char *repo_id,
 
 char *
 seafile_check_permission (const char *repo_id, const char *user, GError **error);
+
+char *
+seafile_check_permission_by_path (const char *repo_id, const char *path,
+                                  const char *user, GError **error);
+
+GList *
+seafile_list_dir_with_perm (const char *repo_id,
+                            const char *path,
+                            const char *dir_id,
+                            const char *user,
+                            int offset,
+                            int limit,
+                            GError **error);
 
 int
 seafile_set_inner_pub_repo (const char *repo_id,
@@ -841,6 +976,7 @@ seafile_create_virtual_repo (const char *origin_repo_id,
                              const char *repo_name,
                              const char *repo_desc,
                              const char *owner,
+                             const char *passwd,
                              GError **error);
 
 GList *
@@ -854,6 +990,11 @@ seafile_get_virtual_repo (const char *origin_repo,
 
 char *
 seafile_get_system_default_repo_id (GError **error);
+
+/* Clean trash */
+
+int
+seafile_clean_up_repo_history (const char *repo_id, int keep_days, GError **error);
 
 /* ------------------ public RPC calls. ------------ */
 
@@ -873,4 +1014,19 @@ char *seafile_diff_pub (const char *repo_id, const char *old, const char *new,
 
 GList * seafile_list_dir_pub (const char *dir_id, GError **error);
 
+GList *
+seafile_get_shared_users_for_subdir (const char *repo_id,
+                                     const char *path,
+                                     const char *from_user,
+                                     GError **error);
+GList *
+seafile_get_shared_groups_for_subdir (const char *repo_id,
+                                      const char *path,
+                                      const char *from_user,
+                                      GError **error);
+GObject *
+seafile_generate_magic_and_random_key(int enc_version,
+                                      const char* repo_id,
+                                      const char *passwd,
+                                      GError **error);
 #endif

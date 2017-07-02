@@ -158,6 +158,9 @@ add_event_to_queue (WTStatus *status,
     case WT_EVENT_CREATE_OR_UPDATE:
         name = "create/update";
         break;
+    case WT_EVENT_SCAN_DIR:
+        name = "scan dir";
+        break;
     case WT_EVENT_DELETE:
         name = "delete";
         break;
@@ -179,6 +182,16 @@ add_event_to_queue (WTStatus *status,
     pthread_mutex_lock (&status->q_lock);
     g_queue_push_tail (status->event_q, event);
     pthread_mutex_unlock (&status->q_lock);
+
+    if (type == WT_EVENT_CREATE_OR_UPDATE) {
+        pthread_mutex_lock (&status->ap_q_lock);
+
+        char *last = g_queue_peek_tail (status->active_paths);
+        if (!last || strcmp(last, path) != 0)
+            g_queue_push_tail (status->active_paths, g_strdup(path));
+
+        pthread_mutex_unlock (&status->ap_q_lock);
+    }
 }
 
 /*
@@ -276,6 +289,7 @@ is_modify_close_write (EventInfo *e1, struct inotify_event *e2)
     return ((e1->mask & IN_MODIFY) && (e2->mask & IN_CLOSE_WRITE));
 }
 
+#if 0
 static gboolean
 handle_consecutive_duplicate_event (RepoWatchInfo *info, struct inotify_event *event)
 {
@@ -296,6 +310,7 @@ handle_consecutive_duplicate_event (RepoWatchInfo *info, struct inotify_event *e
 
     return duplicate;
 }
+#endif
 
 static void
 process_one_event (int in_fd,
@@ -320,8 +335,8 @@ process_one_event (int in_fd,
         return;
     }
 
-    if (handle_consecutive_duplicate_event (info, event))
-        add_to_queue = FALSE;
+    /* if (handle_consecutive_duplicate_event (info, event)) */
+    /*     add_to_queue = FALSE; */
 
     filename = g_build_filename (parent, event->name, NULL);
 
@@ -595,8 +610,8 @@ add_watch (SeafWTMonitorPriv *priv, const char *repo_id, const char *worktree)
         return -1;
     }
 
-    /* An empty path indicates repo-mgr to scan the whole worktree. */
-    add_event_to_queue (info->status, WT_EVENT_CREATE_OR_UPDATE, "", NULL);
+    /* A special event indicates repo-mgr to scan the whole worktree. */
+    add_event_to_queue (info->status, WT_EVENT_SCAN_DIR, "", NULL);
 
     return inotify_fd;
 }

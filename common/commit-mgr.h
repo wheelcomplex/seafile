@@ -28,6 +28,8 @@ struct _SeafCommit {
     char       *repo_name;
     char       *repo_desc;
     char       *repo_category;
+    char       *device_name;
+    char       *client_version;
 
     gboolean    encrypted;         
     int         enc_version;
@@ -38,6 +40,7 @@ struct _SeafCommit {
     int         version;
     gboolean    new_merge;
     gboolean    conflict;
+    gboolean    repaired;
 };
 
 
@@ -176,12 +179,17 @@ seaf_commit_manager_traverse_commit_tree_with_limit (SeafCommitManager *mgr,
                                                      const char *head,
                                                      CommitTraverseFunc func,
                                                      int limit,
-                                                     void *data);
+                                                     void *data,
+                                                     gboolean skip_errors);
 
 gboolean
 seaf_commit_manager_commit_exists (SeafCommitManager *mgr,
                                    const char *repo_id,
                                    int version,
                                    const char *id);
+
+int
+seaf_commit_manager_remove_store (SeafCommitManager *mgr,
+                                  const char *store_id);
 
 #endif

@@ -170,7 +170,9 @@ int diff_index(const char *repo_id, int version,
 inline static gboolean
 dirent_same (SeafDirent *denta, SeafDirent *dentb)
 {
-    return (strcmp (dentb->id, denta->id) == 0 && denta->mode == dentb->mode);
+    return (strcmp (dentb->id, denta->id) == 0 &&
+	    denta->mode == dentb->mode &&
+	    denta->mtime == dentb->mtime);
 }
 
 static int
@@ -233,7 +235,8 @@ diff_directories (int n, SeafDirent *dents[], const char *basedir, DiffOptions *
                                                opt->version,
                                                dents[i]->id);
             if (!dir) {
-                seaf_warning ("Failed to find dir %s.\n", dents[i]->id);
+                seaf_warning ("Failed to find dir %s:%s.\n",
+                              opt->store_id, dents[i]->id);
                 ret = -1;
                 goto free_sub_dirs;
             }
@@ -343,7 +346,7 @@ diff_trees (int n, const char *roots[], DiffOptions *opt)
                                             opt->version,
                                             roots[i]);
         if (!root) {
-            seaf_warning ("Failed to find dir %s.\n", roots[i]);
+            seaf_warning ("Failed to find dir %s:%s.\n", opt->store_id, roots[i]);
             g_free (trees);
             return -1;
         }
@@ -584,7 +587,7 @@ diff_merge (SeafCommit *merge, GList **results, gboolean fold_dir_diff)
                                               repo->version,
                                               merge->parent_id);
     if (!parent1) {
-        seaf_warning ("failed to find commit %s.\n", merge->parent_id);
+        seaf_warning ("failed to find commit %s:%s.\n", repo->id, merge->parent_id);
         return -1;
     }
 
@@ -593,7 +596,8 @@ diff_merge (SeafCommit *merge, GList **results, gboolean fold_dir_diff)
                                               repo->version,
                                               merge->second_parent_id);
     if (!parent2) {
-        seaf_warning ("failed to find commit %s.\n", merge->second_parent_id);
+        seaf_warning ("failed to find commit %s:%s.\n",
+                      repo->id, merge->second_parent_id);
         seaf_commit_unref (parent1);
         return -1;
     }
@@ -684,7 +688,8 @@ diff_resolve_renames (GList **diff_entries)
     /* Collect all "deleted" entries. */
     for (p = *diff_entries; p != NULL; p = p->next) {
         de = p->data;
-        if (de->status == DIFF_STATUS_DELETED &&
+        if ((de->status == DIFF_STATUS_DELETED ||
+             de->status == DIFF_STATUS_DIR_DELETED) &&
             memcmp (de->sha1, empty_sha1, 20) != 0)
             g_hash_table_insert (deleted, de->sha1, p);
     }
@@ -692,7 +697,8 @@ diff_resolve_renames (GList **diff_entries)
     /* Collect all "added" entries into a separate list. */
     for (p = *diff_entries; p != NULL; p = p->next) {
         de = p->data;
-        if (de->status == DIFF_STATUS_ADDED &&
+        if ((de->status == DIFF_STATUS_ADDED ||
+             de->status == DIFF_STATUS_DIR_ADDED) &&
             memcmp (de->sha1, empty_sha1, 20) != 0)
             added = g_list_prepend (added, p);
     }
@@ -704,6 +710,7 @@ diff_resolve_renames (GList **diff_entries)
     while (p != NULL) {
         GList *p_add, *p_del;
         DiffEntry *de_add, *de_del, *de_rename;
+        int rename_status;
 
         p_add = p->data;
         de_add = p_add->data;
@@ -711,7 +718,13 @@ diff_resolve_renames (GList **diff_entries)
         p_del = g_hash_table_lookup (deleted, de_add->sha1);
         if (p_del) {
             de_del = p_del->data;
-            de_rename = diff_entry_new (de_del->type, DIFF_STATUS_RENAMED, 
+
+            if (de_add->status == DIFF_STATUS_DIR_ADDED)
+                rename_status = DIFF_STATUS_DIR_RENAMED;
+            else
+                rename_status = DIFF_STATUS_RENAMED;
+
+            de_rename = diff_entry_new (de_del->type, rename_status, 
                                         de_del->sha1, de_del->name);
             de_rename->new_name = g_strdup(de_add->name);
 
@@ -808,7 +821,7 @@ int diff_unmerged_state(int mask)
         case 4:
             return STATUS_UNMERGED_DFC_OTHERS_ADDED_FILE;
         default:
-            g_warning ("Unexpected unmerged case\n");
+            seaf_warning ("Unexpected unmerged case\n");
     }
     return 0;
 }
@@ -854,10 +867,10 @@ diff_results_to_description (GList *results)
 {
     GList *p;
     DiffEntry *de;
-    char *new_file = NULL, *removed_file = NULL;
-    char *renamed_file = NULL, *modified_file = NULL;
+    char *add_mod_file = NULL, *removed_file = NULL;
+    char *renamed_file = NULL;
     char *new_dir = NULL, *removed_dir = NULL;
-    int n_new = 0, n_removed = 0, n_renamed = 0, n_modified = 0;
+    int n_add_mod = 0, n_removed = 0, n_renamed = 0;
     int n_new_dir = 0, n_removed_dir = 0;
     GString *desc;
 
@@ -868,9 +881,9 @@ diff_results_to_description (GList *results)
         de = p->data;
         switch (de->status) {
         case DIFF_STATUS_ADDED:
-            if (n_new == 0)
-                new_file = get_basename(de->name);
-            n_new++;
+            if (n_add_mod == 0)
+                add_mod_file = get_basename(de->name);
+            n_add_mod++;
             break;
         case DIFF_STATUS_DELETED:
             if (n_removed == 0)
@@ -883,9 +896,9 @@ diff_results_to_description (GList *results)
             n_renamed++;
             break;
         case DIFF_STATUS_MODIFIED:
-            if (n_modified == 0)
-                modified_file = get_basename(de->name);
-            n_modified++;
+            if (n_add_mod == 0)
+                add_mod_file = get_basename(de->name);
+            n_add_mod++;
             break;
         case DIFF_STATUS_DIR_ADDED:
             if (n_new_dir == 0)
@@ -902,11 +915,11 @@ diff_results_to_description (GList *results)
 
     desc = g_string_new ("");
 
-    if (n_new == 1)
-        g_string_append_printf (desc, "Added \"%s\".\n", new_file);
-    else if (n_new > 1)
-        g_string_append_printf (desc, "Added \"%s\" and %d more files.\n",
-                                new_file, n_new - 1);
+    if (n_add_mod == 1)
+        g_string_append_printf (desc, "Added or modified \"%s\".\n", add_mod_file);
+    else if (n_add_mod > 1)
+        g_string_append_printf (desc, "Added or modified \"%s\" and %d more files.\n",
+                                add_mod_file, n_add_mod - 1);
 
     if (n_removed == 1)
         g_string_append_printf (desc, "Deleted \"%s\".\n", removed_file);
@@ -919,12 +932,6 @@ diff_results_to_description (GList *results)
     else if (n_renamed > 1)
         g_string_append_printf (desc, "Renamed \"%s\" and %d more files.\n",
                                 renamed_file, n_renamed - 1);
-
-    if (n_modified == 1)
-        g_string_append_printf (desc, "Modified \"%s\".\n", modified_file);
-    else if (n_modified > 1)
-        g_string_append_printf (desc, "Modified \"%s\" and %d more files.\n",
-                                modified_file, n_modified - 1);
 
     if (n_new_dir == 1)
         g_string_append_printf (desc, "Added directory \"%s\".\n", new_dir);

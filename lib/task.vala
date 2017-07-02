@@ -23,8 +23,11 @@ public class Task : Object {
 
 	public string error_str { get; set; }
 
-    public int block_total { get; set; }
-    public int block_done { get; set; } // the number of blocks sent or received
+    public int64 block_total { get; set; }
+    public int64 block_done { get; set; } // the number of blocks sent or received
+
+    public int fs_objects_total { get; set; }
+    public int fs_objects_done { get; set; }
 
 	public int rate { get; set; }
 
@@ -45,6 +48,7 @@ public class Task : Object {
 public class CloneTask : Object {
        public string state { get; set; }
        public string error_str { get; set; }
+       public string err_detail { get; set; }
        public string repo_id { get; set; }
        public string peer_id { get; set; }
        public string repo_name { get; set; }
